@@ -299,7 +299,7 @@ After 25 iterations, top-scoring nodes are deep-read using GPT-4o vision on actu
 
 ## License
 
-MIT
+[MIT](LICENSE)
 
 ---
 
