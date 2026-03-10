@@ -14,7 +14,7 @@ from rich.table import Table
 from dataclasses import dataclass, field
 
 from .config import TreeRAGConfig
-from .models import DocumentIndex, FolderIndex, SearchResult, QueryResult
+from .models import DocumentIndex, FolderIndex, SearchResult, QueryResult, SearchStats
 from .llm_client import LLMClient
 from .indexer import Indexer
 from .mcts import MCTSEngine, SYSTEM_PROMPT_DEEP_READ, SYSTEM_PROMPT_ANSWER
@@ -210,8 +210,11 @@ class TreeRAGPipeline:
                 "phase2_time": f"{result.phase2_time:.1f}s",
                 "total_time": f"{total_time:.1f}s",
                 "llm_calls": total_calls,
+                "mcts_iterations": result.total_mcts_iterations,
                 "cost": f"${self.llm._estimate_cost():.4f}",
                 "docs_searched": result.documents_searched,
+                "phase1_search_stats": result.phase1_stats.to_dict() if result.phase1_stats else None,
+                "phase2_search_stats": [s.to_dict() for s in result.phase2_stats] if result.phase2_stats else [],
             },
         )
 
@@ -238,13 +241,14 @@ class TreeRAGPipeline:
 
         # Phase 1
         p1_start = time.time()
-        doc_scores = self.mcts.search_meta(query, folder_index)
+        doc_scores, phase1_stats = self.mcts.search_meta(query, folder_index)
         p1_time = time.time() - p1_start
 
         if not doc_scores:
             return QueryResult(
                 query=query, answer="No relevant documents found in this folder.",
                 latency_seconds=time.time() - start_time, phase1_time=p1_time,
+                phase1_stats=phase1_stats,
             )
 
         # Load selected document indices (gracefully skips broken ones)
@@ -257,14 +261,15 @@ class TreeRAGPipeline:
                 answer="Selected documents have missing or corrupt indices. Run 'folder refresh' to repair.",
                 documents_searched=[e.filename for e in selected_entries],
                 latency_seconds=time.time() - start_time, phase1_time=p1_time,
+                phase1_stats=phase1_stats,
             )
 
         # Phase 2
         p2_start = time.time()
         if self.config.mcts.parallel_phase2 and len(doc_indices) > 1:
-            search_results = self.mcts.search_documents_parallel(query, doc_indices)
+            search_results, phase2_stats = self.mcts.search_documents_parallel(query, doc_indices)
         else:
-            search_results = self.mcts.search_documents_sequential(query, doc_indices)
+            search_results, phase2_stats = self.mcts.search_documents_sequential(query, doc_indices)
         p2_time = time.time() - p2_start
 
         if not search_results:
@@ -273,6 +278,7 @@ class TreeRAGPipeline:
                 documents_searched=[e.filename for e in selected_entries],
                 latency_seconds=time.time() - start_time,
                 phase1_time=p1_time, phase2_time=p2_time,
+                phase1_stats=phase1_stats, phase2_stats=phase2_stats,
             )
 
         # Deep Read
@@ -283,13 +289,15 @@ class TreeRAGPipeline:
         console.print("\n[bold]Generating answer...[/bold]")
         answer = self._generate_answer(query, search_results)
 
+        total_iters = (phase1_stats.iterations_used if phase1_stats else 0) + sum(s.iterations_used for s in phase2_stats)
         result = QueryResult(
             query=query, answer=answer, sources=search_results,
             documents_searched=[e.filename for e in selected_entries],
-            total_mcts_iterations=self.config.mcts.meta_iterations + self.config.mcts.iterations * len(doc_indices),
+            total_mcts_iterations=total_iters,
             total_llm_calls=self.llm.total_calls - llm_before,
             latency_seconds=time.time() - start_time,
             phase1_time=p1_time, phase2_time=p2_time,
+            phase1_stats=phase1_stats, phase2_stats=phase2_stats,
         )
         self._print_result(result)
         return result
@@ -307,13 +315,14 @@ class TreeRAGPipeline:
             title="Query", border_style="cyan",
         ))
 
-        search_results = self.mcts.search_document(query, doc_index)
+        search_results, doc_stats = self.mcts.search_document(query, doc_index)
 
         if not search_results:
             return QueryResult(
                 query=query, answer="No relevant sections found.",
                 documents_searched=[doc_index.filename],
                 latency_seconds=time.time() - start_time,
+                phase2_stats=[doc_stats],
             )
 
         console.print("\n[bold]Deep reading...[/bold]")
@@ -325,8 +334,10 @@ class TreeRAGPipeline:
         result = QueryResult(
             query=query, answer=answer, sources=search_results,
             documents_searched=[doc_index.filename],
+            total_mcts_iterations=doc_stats.iterations_used,
             total_llm_calls=self.llm.total_calls - llm_before,
             latency_seconds=time.time() - start_time,
+            phase2_stats=[doc_stats],
         )
         self._print_result(result)
         return result
@@ -462,9 +473,19 @@ class TreeRAGPipeline:
             console.print(table)
 
         timing = f"Phase 1: {result.phase1_time:.1f}s | Phase 2: {result.phase2_time:.1f}s | " if result.phase1_time else ""
-        console.print(f"\n[dim]{timing}Total: {result.latency_seconds:.1f}s | LLM calls: {result.total_llm_calls} | Cost: ~${self.llm._estimate_cost():.4f}[/dim]")
+        console.print(f"\n[dim]{timing}Total: {result.latency_seconds:.1f}s | LLM calls: {result.total_llm_calls} | Iterations: {result.total_mcts_iterations} | Cost: ~${self.llm._estimate_cost():.4f}[/dim]")
         if result.documents_searched:
             console.print(f"[dim]Searched: {', '.join(result.documents_searched)}[/dim]")
+
+        # Adaptive search stats
+        if result.phase1_stats and result.phase1_stats.iterations_used > 0:
+            s = result.phase1_stats
+            conv = f"converged@{s.convergence_iteration+1} ({s.convergence_reason})" if s.converged else f"{s.iterations_used} iters"
+            console.print(f"[dim]Phase 1: {conv}, {s.pruned_branches} docs pruned, coverage: {s.coverage_pct:.0f}%[/dim]")
+        for i, s in enumerate(result.phase2_stats):
+            if s.iterations_used > 0:
+                conv = f"converged@{s.convergence_iteration+1} ({s.convergence_reason})" if s.converged else f"{s.iterations_used} iters"
+                console.print(f"[dim]Phase 2 doc {i+1}: {conv}, coverage: {s.coverage_pct:.0f}%, pruned: {s.pruned_branches}[/dim]")
 
     def _set_parent_refs(self, node):
         for c in node.children:

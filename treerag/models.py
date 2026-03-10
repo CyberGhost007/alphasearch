@@ -61,6 +61,7 @@ class TreeNode:
     visit_count: int = 0
     total_reward: float = 0.0
     parent: Optional["TreeNode"] = None
+    pruned: bool = False
 
     @property
     def average_reward(self) -> float:
@@ -80,6 +81,7 @@ class TreeNode:
     def reset_mcts_state(self):
         self.visit_count = 0
         self.total_reward = 0.0
+        self.pruned = False
         for c in self.children:
             c.reset_mcts_state()
 
@@ -208,6 +210,7 @@ class FolderDocEntry:
 
     visit_count: int = 0
     total_reward: float = 0.0
+    pruned: bool = False
 
     @property
     def average_reward(self) -> float:
@@ -227,6 +230,7 @@ class FolderDocEntry:
     def reset_mcts_state(self):
         self.visit_count = 0
         self.total_reward = 0.0
+        self.pruned = False
 
     def to_dict(self) -> dict:
         return {
@@ -373,6 +377,40 @@ class DocumentScore:
 
 
 @dataclass
+class SearchStats:
+    """Detailed statistics about an adaptive MCTS search run."""
+    iterations_used: int = 0
+    iterations_max: int = 0
+    converged: bool = False
+    convergence_reason: str = ""
+    convergence_iteration: int = 0
+    total_nodes: int = 0
+    visited_nodes: int = 0
+    coverage_pct: float = 0.0
+    pruned_branches: int = 0
+    pruned_at_iterations: list[int] = field(default_factory=list)
+    exploration_start: float = 0.0
+    exploration_end: float = 0.0
+    mean_reward: float = 0.0
+    reward_variance: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "iterations_used": self.iterations_used,
+            "iterations_max": self.iterations_max,
+            "converged": self.converged,
+            "convergence_reason": self.convergence_reason,
+            "convergence_iteration": self.convergence_iteration,
+            "total_nodes": self.total_nodes,
+            "visited_nodes": self.visited_nodes,
+            "coverage_pct": round(self.coverage_pct, 1),
+            "pruned_branches": self.pruned_branches,
+            "mean_reward": round(self.mean_reward, 4),
+            "reward_variance": round(self.reward_variance, 4),
+        }
+
+
+@dataclass
 class QueryResult:
     query: str
     answer: str
@@ -383,3 +421,5 @@ class QueryResult:
     latency_seconds: float = 0.0
     phase1_time: float = 0.0
     phase2_time: float = 0.0
+    phase1_stats: Optional["SearchStats"] = None
+    phase2_stats: list["SearchStats"] = field(default_factory=list)
