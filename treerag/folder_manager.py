@@ -30,7 +30,7 @@ from .models import (
 from .indexer import Indexer
 from .pdf_processor import PDFProcessor
 from .tabular_processor import TabularProcessor, SUPPORTED_TABULAR_EXTENSIONS
-from .tabular_indexer import TabularIndexer
+from .bm25 import BM25Index
 from .exceptions import (
     FolderNotFoundError, FolderAlreadyExistsError,
     DocumentNotFoundError, DuplicateFilenameWarning,
@@ -55,7 +55,6 @@ class FolderManager:
         self.config = config
         self._pipeline = pipeline  # Lazy reference to pipeline for LLM access
         self._indexer = None
-        self._tabular_indexer = None
         self.pdf_processor = PDFProcessor(
             dpi=config.indexer.image_dpi,
             max_pages=config.indexer.max_pages,
@@ -68,7 +67,7 @@ class FolderManager:
 
     @property
     def indexer(self):
-        """Lazy-init PDF indexer — only created when actually indexing (needs API key)."""
+        """Lazy-init indexer — handles both PDFs and tabular files."""
         if self._indexer is None:
             if self._pipeline:
                 self._indexer = Indexer(self.config, self._pipeline.llm)
@@ -78,27 +77,9 @@ class FolderManager:
                 self._indexer = Indexer(self.config, llm)
         return self._indexer
 
-    @property
-    def tabular_indexer(self):
-        """Lazy-init tabular indexer — only created when indexing CSV/Excel."""
-        if self._tabular_indexer is None:
-            if self._pipeline:
-                self._tabular_indexer = TabularIndexer(self.config, self._pipeline.llm)
-            else:
-                from .llm_client import LLMClient
-                llm = LLMClient(self.config.model)
-                self._tabular_indexer = TabularIndexer(self.config, llm)
-        return self._tabular_indexer
-
     def _is_tabular(self, file_path: Path) -> bool:
         """Check if file is a tabular type (CSV/Excel)."""
         return file_path.suffix.lower() in SUPPORTED_TABULAR_EXTENSIONS
-
-    def _get_indexer(self, file_path: Path):
-        """Return the right indexer for the file type."""
-        if self._is_tabular(file_path):
-            return self.tabular_indexer
-        return self.indexer
 
     def _get_folder_lock(self, folder_name: str) -> threading.Lock:
         with self._locks_lock:
@@ -244,14 +225,30 @@ class FolderManager:
                         f"Failed to copy '{pdf_path.name}' to folder: {e}. Check disk space."
                     ) from e
 
-        # 6. Build document tree index (dispatch by file type)
+        # 6. Build document tree index
         index_path = folder_dir / "indices" / f"{pdf_path.stem}_tree.json"
-        indexer = self._get_indexer(pdf_path)
         try:
-            doc_index = indexer.index_document(
-                stored_pdf_path, save_path=index_path,
-                skip_validation=skip_validation,
-            )
+            if is_tabular:
+                # Tabular: load with tabular processor, index with text mode
+                loaded = self.tabular_processor.load(stored_pdf_path)
+                doc_index = self.indexer.index_document(
+                    stored_pdf_path, save_path=index_path,
+                    skip_validation=skip_validation,
+                    use_vision=False, loaded_doc=loaded,
+                )
+                # Build BM25 index
+                bm25_path = index_path.with_suffix(".bm25.json")
+                bm25_idx = self._build_bm25_index(doc_index, stored_pdf_path)
+                bm25_idx.save(bm25_path)
+                doc_index.bm25_index_path = str(bm25_path)
+                doc_index.save(index_path)
+                console.print(f"  [green]BM25 index:[/green] {bm25_idx}")
+            else:
+                # PDF: standard vision-based indexing
+                doc_index = self.indexer.index_document(
+                    stored_pdf_path, save_path=index_path,
+                    skip_validation=skip_validation,
+                )
         except IndexingFailedError:
             # Cleanup copied file if indexing failed
             if copy_pdf and stored_pdf_path != pdf_path and stored_pdf_path.exists():
@@ -260,7 +257,10 @@ class FolderManager:
 
         # 7. Generate document-level summary
         console.print("[bold]Generating document summary for meta-tree...[/bold]")
-        summary, keywords = indexer.generate_document_summary(stored_pdf_path)
+        if is_tabular:
+            summary, keywords = self.indexer.generate_document_summary_text(stored_pdf_path)
+        else:
+            summary, keywords = self.indexer.generate_document_summary(stored_pdf_path)
 
         # 8. Create entry and update folder index (thread-safe)
         entry = FolderDocEntry(
@@ -339,6 +339,10 @@ class FolderManager:
         # Delete files (ignore errors — best effort)
         # Check both pdfs/ and files/ dirs for backward compat
         paths_to_delete = [entry.index_path]
+        # Also delete BM25 index file if it exists (sibling .bm25.json)
+        if entry.index_path:
+            bm25_path = Path(entry.index_path).with_suffix(".bm25.json")
+            paths_to_delete.append(str(bm25_path))
         for subdir in ["pdfs", "files"]:
             paths_to_delete.append(str(folder_dir / subdir / filename))
         for path_str in paths_to_delete:
@@ -373,8 +377,9 @@ class FolderManager:
         folder_dir = self.base_dir / folder_name
 
         issues = {
-            "missing_pdfs": [],       # Meta-tree entry but PDF gone
+            "missing_pdfs": [],       # Meta-tree entry but source file gone
             "missing_indices": [],    # Meta-tree entry but index JSON gone
+            "missing_bm25": [],       # Tabular doc but BM25 index file gone
             "stale_entries": [],      # File hash changed
             "orphaned_indices": [],   # Index file exists but no meta-tree entry
             "healthy": [],            # Everything OK
@@ -394,14 +399,25 @@ class FolderManager:
                 if current_hash != entry.file_hash:
                     issues["stale_entries"].append(entry.filename)
                 else:
-                    issues["healthy"].append(entry.filename)
+                    # Check BM25 index for tabular files
+                    if self._is_tabular(Path(entry.filename)):
+                        bm25_path = Path(entry.index_path).with_suffix(".bm25.json")
+                        if not bm25_path.exists():
+                            issues["missing_bm25"].append(entry.filename)
+                        else:
+                            issues["healthy"].append(entry.filename)
+                    else:
+                        issues["healthy"].append(entry.filename)
 
         # Check for orphaned index files
         index_dir = folder_dir / "indices"
         if index_dir.exists():
             known_indices = {Path(d.index_path).name for d in folder_index.documents if d.index_path}
+            # Also track known BM25 files
+            known_bm25 = {Path(d.index_path).stem + ".bm25.json" for d in folder_index.documents if d.index_path}
+            known_files = known_indices | known_bm25
             for f in index_dir.iterdir():
-                if f.suffix == ".json" and f.name not in known_indices:
+                if f.suffix == ".json" and f.name not in known_files:
                     issues["orphaned_indices"].append(f.name)
 
         return issues
@@ -418,8 +434,9 @@ class FolderManager:
 
         console.print(f"\n[bold]Repairing folder: {folder_name}[/bold]")
         console.print(f"  Healthy: {len(issues['healthy'])}")
-        console.print(f"  Missing PDFs: {len(issues['missing_pdfs'])}")
+        console.print(f"  Missing source files: {len(issues['missing_pdfs'])}")
         console.print(f"  Missing indices: {len(issues['missing_indices'])}")
+        console.print(f"  Missing BM25: {len(issues.get('missing_bm25', []))}")
         console.print(f"  Stale (changed): {len(issues['stale_entries'])}")
         console.print(f"  Orphaned indices: {len(issues['orphaned_indices'])}")
 
@@ -439,6 +456,17 @@ class FolderManager:
             entry = folder_index.get_document(fname)
             if entry and entry.pdf_path and Path(entry.pdf_path).exists():
                 console.print(f"  [cyan]Re-indexing (missing index): {fname}[/cyan]")
+                try:
+                    self.add_document(folder_name, entry.pdf_path, copy_pdf=False)
+                except Exception as e:
+                    console.print(f"  [red]Failed to re-index {fname}: {e}[/red]")
+
+        # Re-index entries with missing BM25 indices
+        for fname in issues.get("missing_bm25", []):
+            folder_index = self.load_folder(folder_name)
+            entry = folder_index.get_document(fname)
+            if entry and entry.pdf_path and Path(entry.pdf_path).exists():
+                console.print(f"  [cyan]Re-indexing (missing BM25): {fname}[/cyan]")
                 try:
                     self.add_document(folder_name, entry.pdf_path, copy_pdf=False)
                 except Exception as e:
@@ -488,10 +516,10 @@ class FolderManager:
 
         doc_index = DocumentIndex.load(idx_path)
 
-        # Verify PDF still exists (needed for deep reads)
+        # Verify source file still exists (needed for deep reads)
         if entry.pdf_path and not Path(entry.pdf_path).exists():
             console.print(
-                f"[yellow]Warning: PDF missing for '{entry.filename}'. "
+                f"[yellow]Warning: Source file missing for '{entry.filename}'. "
                 f"Search will work but deep reads will be skipped.[/yellow]"
             )
 
@@ -512,6 +540,51 @@ class FolderManager:
     # =========================================================================
     # Validation Helpers
     # =========================================================================
+
+    def _build_bm25_index(self, doc_index: DocumentIndex, file_path: Path) -> BM25Index:
+        """Build BM25 index from a tabular document's tree + raw page text."""
+        node_texts: dict[str, str] = {}
+
+        if doc_index.root:
+            # Load file ONCE and pass to all nodes (avoids O(n_leaves) file parses)
+            try:
+                loaded = self.tabular_processor.load(file_path)
+            except Exception:
+                loaded = None
+            try:
+                self._collect_node_texts_for_bm25(doc_index.root, node_texts, loaded)
+            finally:
+                if loaded:
+                    loaded.close()
+
+        return BM25Index().build(node_texts)
+
+    def _collect_node_texts_for_bm25(
+        self, node, texts: dict, loaded_doc
+    ):
+        """Collect text for each tree node for BM25 indexing."""
+        if node.is_leaf:
+            if loaded_doc:
+                try:
+                    page_texts = []
+                    for p in range(node.start_page, node.end_page + 1):
+                        if p < loaded_doc.total_pages:
+                            page_texts.append(loaded_doc.get_page_text(p))
+                    texts[node.node_id] = "\n".join(page_texts)
+                except Exception:
+                    texts[node.node_id] = (
+                        f"{node.title} {node.summary} {' '.join(node.keywords)}"
+                    )
+            else:
+                texts[node.node_id] = (
+                    f"{node.title} {node.summary} {' '.join(node.keywords)}"
+                )
+        else:
+            texts[node.node_id] = (
+                f"{node.title} {node.summary} {' '.join(node.keywords)}"
+            )
+            for child in node.children:
+                self._collect_node_texts_for_bm25(child, texts, loaded_doc)
 
     def _validate_folder_name(self, name: str):
         """Validate folder name characters."""

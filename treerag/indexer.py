@@ -1,11 +1,14 @@
 """
-Document Indexer — builds tree index from PDF with cleanup on failure.
+Document Indexer — builds tree index from PDF or tabular files.
+Supports two modes:
+  - Vision mode (PDFs): reads page images, sends to LLM for analysis
+  - Text mode (CSV/Excel): reads markdown table pages, sends text to LLM
 If indexing fails midway, any partial files are cleaned up.
 """
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Protocol, runtime_checkable
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
@@ -14,6 +17,18 @@ from .models import TreeNode, DocumentIndex, compute_file_hash
 from .llm_client import LLMClient
 from .pdf_processor import PDFProcessor, LoadedPDF
 from .exceptions import IndexingFailedError
+
+
+@runtime_checkable
+class LoadedDocument(Protocol):
+    """Protocol for any loaded document (PDF or tabular)."""
+    @property
+    def total_pages(self) -> int: ...
+    def get_page_text(self, page_num: int) -> str: ...
+    def get_page_image(self, page_num: int) -> bytes: ...
+    def get_page_images_batch(self, start: int, end: int) -> list[bytes]: ...
+    def get_pages_text_batch(self, start: int, end: int) -> str: ...
+    def close(self) -> None: ...
 
 console = Console()
 
@@ -89,6 +104,41 @@ SYSTEM_PROMPT_DOC_SUMMARY = """You are summarizing a document for search purpose
 
 Keywords should be specific nouns someone might search for, not generic terms. Include company names, product names, technologies, dates."""
 
+SYSTEM_PROMPT_ANALYZE_TEXT = """You are a document structure analyst. You receive text content from pages of a document and must identify ALL logical sections — every page must be covered.
+
+CRITICAL RULES:
+1. Every single page must belong to at least one section. Do NOT skip pages.
+2. Summaries must capture the ACTUAL CONTENT — specific data, names, numbers, key values — not just "this page contains data..."
+3. For tabular data: mention specific column names, notable values, categories, date ranges, and any patterns you see.
+4. Group related pages together when they share similar data patterns.
+
+Output JSON:
+{
+  "sections": [
+    {
+      "title": "Descriptive section title",
+      "start_page": <0-indexed>,
+      "end_page": <0-indexed, inclusive>,
+      "level": <1=major section, 2=sub-section, 3=detail>,
+      "summary": "2-3 sentences with SPECIFIC information. Include column names, value ranges, notable entries, categories found.",
+      "keywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"]
+    }
+  ],
+  "continues_previous": true/false,
+  "continues_next": true/false
+}
+
+IMPORTANT: The total page coverage must span all pages. Missing pages = failed analysis."""
+
+SYSTEM_PROMPT_DOC_SUMMARY_TEXT = """You are summarizing a tabular dataset for search purposes. Given the first few pages of data, generate:
+
+{
+  "summary": "3-5 sentences about this dataset. Be SPECIFIC: include column names, row counts, value ranges, date spans, categories found, notable entries. This summary decides if this file is relevant to queries.",
+  "keywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5", "keyword6", "keyword7", "keyword8"]
+}
+
+Keywords should be specific: column names, category values, company names, product names, identifiers found in the data."""
+
 
 class Indexer:
     def __init__(self, config: TreeRAGConfig, llm: LLMClient):
@@ -103,38 +153,52 @@ class Indexer:
         self, pdf_path: str | Path,
         save_path: Optional[str | Path] = None,
         skip_validation: bool = False,
+        use_vision: bool = True,
+        loaded_doc: Optional["LoadedDocument"] = None,
     ) -> DocumentIndex:
         """
         Build a complete tree index. On failure, cleans up any partial save_path.
+
+        Args:
+            pdf_path: Path to the file (PDF, CSV, or Excel).
+            save_path: Where to save the index JSON.
+            skip_validation: Skip summary validation step.
+            use_vision: True for PDFs (page images), False for tabular (text).
+            loaded_doc: Pre-loaded document. If None, loads via pdf_processor.
         """
         pdf_path = Path(pdf_path)
         save_path = Path(save_path) if save_path else None
 
-        # Validate PDF first (raises on bad files)
-        self.pdf_processor.validate(pdf_path)
+        # Load document
+        if loaded_doc is not None:
+            doc = loaded_doc
+        else:
+            self.pdf_processor.validate(pdf_path)
+            doc = self.pdf_processor.load(pdf_path)
 
         console.print(f"\n[bold blue]Indexing:[/bold blue] {pdf_path.name}")
-        pdf = self.pdf_processor.load(pdf_path)
-        console.print(f"  Pages: {pdf.total_pages}")
+        console.print(f"  Pages: {doc.total_pages} | Mode: {'vision' if use_vision else 'text'}")
 
         try:
             # Step 1: Analyze
             console.print("\n[bold]Step 1:[/bold] Analyzing document structure...")
-            all_sections = self._analyze_pages(pdf)
+            if use_vision:
+                all_sections = self._analyze_pages(doc)
+            else:
+                all_sections = self._analyze_pages_text(doc)
             console.print(f"  Found {len(all_sections)} sections")
 
             # Step 2: Build tree
             console.print("\n[bold]Step 2:[/bold] Building tree index...")
-            tree = self._build_tree(all_sections, pdf.total_pages)
+            tree = self._build_tree(all_sections, doc.total_pages)
 
-            # Step 3: Validate
-            if not skip_validation:
+            # Step 3: Validate (vision-only — text mode trusts the analysis)
+            if not skip_validation and use_vision:
                 console.print("\n[bold]Step 3:[/bold] Validating summaries...")
-                self._validate_summaries(tree, pdf)
+                self._validate_summaries(tree, doc)
 
         except Exception as e:
-            pdf.close()
-            # Cleanup partial index file
+            doc.close()
             if save_path and save_path.exists():
                 save_path.unlink()
             raise IndexingFailedError(
@@ -144,7 +208,7 @@ class Indexer:
         file_hash = compute_file_hash(pdf_path)
         doc_index = DocumentIndex(
             document_id=file_hash[:12], filename=pdf_path.name,
-            total_pages=pdf.total_pages,
+            total_pages=doc.total_pages,
             description=tree.summary if tree else "",
             root=tree, file_hash=file_hash, pdf_path=str(pdf_path),
         )
@@ -160,7 +224,7 @@ class Indexer:
                     f"Check disk space and permissions."
                 ) from e
 
-        pdf.close()
+        doc.close()
         console.print(f"[bold green]Indexing complete![/bold green] (LLM calls: {self.llm.total_calls})")
         return doc_index
 
@@ -188,7 +252,50 @@ You see the first {num_pages} pages. Summarize what this document is about."""
             pdf.close()
             return f"Document: {pdf_path.name}", []
 
-    # --- Internal methods (same logic, with better error handling) ---
+    def generate_document_summary_text(self, file_path: str | Path, loaded_doc: Optional["LoadedDocument"] = None) -> tuple[str, list[str]]:
+        """Generate document-level summary for tabular files using text (not vision)."""
+        file_path = Path(file_path)
+
+        if loaded_doc is not None:
+            doc = loaded_doc
+            should_close = False
+        else:
+            from .tabular_processor import TabularProcessor
+            processor = TabularProcessor()
+            doc = processor.load(file_path)
+            should_close = True
+
+        # Read first few pages as text
+        num_pages = min(3, doc.total_pages)
+        text_parts = []
+        for i in range(num_pages):
+            text_parts.append(doc.get_page_text(i))
+        sample_text = "\n\n".join(text_parts)
+
+        prompt = (
+            f'Dataset: "{file_path.name}" ({doc.total_pages} pages of tabular data).\n\n'
+            f"First {num_pages} pages:\n{sample_text[:4000]}\n\n"
+            f"Summarize this dataset for search purposes."
+        )
+
+        try:
+            response = self.llm.complete(
+                prompt=prompt,
+                model=self.config.model.indexing_model,
+                system_prompt=SYSTEM_PROMPT_DOC_SUMMARY_TEXT,
+                json_mode=True,
+                max_tokens=1024,
+            )
+            if should_close:
+                doc.close()
+            result = json.loads(response)
+            return result.get("summary", ""), result.get("keywords", [])
+        except Exception:
+            if should_close:
+                doc.close()
+            return f"Tabular dataset: {file_path.name}", []
+
+    # --- Internal methods ---
 
     def _analyze_pages(self, pdf: LoadedPDF) -> list[dict]:
         batch_size = self.config.indexer.batch_size
@@ -251,6 +358,153 @@ Output valid JSON only."""
         all_sections = self._ensure_coverage(all_sections, pdf)
 
         return self._deduplicate(all_sections)
+
+    def _analyze_pages_text(self, doc: "LoadedDocument") -> list[dict]:
+        """
+        Analyze document structure using text content (for tabular files).
+        Same logic as _analyze_pages but sends text instead of images.
+        """
+        batch_size = self.config.indexer.batch_size
+        all_sections: list[dict] = []
+        total_batches = max(1, (doc.total_pages + batch_size - 1) // batch_size)
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Analyzing pages (text)...", total=total_batches)
+            batch_num, start = 0, 0
+
+            while start < doc.total_pages:
+                end = min(start + batch_size - 1, doc.total_pages - 1)
+
+                # Get text for this batch of pages
+                text = doc.get_pages_text_batch(start, end)
+                if not text.strip():
+                    start = end + 1
+                    batch_num += 1
+                    progress.advance(task)
+                    continue
+
+                prompt = (
+                    f"Analyze these pages and identify ALL logical sections. "
+                    f"Every page must be covered.\n\n"
+                    f"Document: {doc.total_pages} total pages. "
+                    f"This batch: pages {start + 1} to {end + 1} "
+                    f"(batch {batch_num + 1} of {total_batches}).\n\n"
+                    f"{'This is the FIRST batch.' if batch_num == 0 else 'This is a CONTINUATION.'}\n"
+                    f"{'This is the LAST batch.' if batch_num + 1 >= total_batches else 'More pages follow.'}\n\n"
+                    f"Content:\n{text[:8000]}\n\n"
+                    f"IMPORTANT: Identify sections with SPECIFIC summaries — "
+                    f"mention column names, values, categories, date ranges.\n"
+                    f"Output valid JSON only."
+                )
+
+                try:
+                    response = self.llm.complete(
+                        prompt=prompt,
+                        model=self.config.model.indexing_model,
+                        system_prompt=SYSTEM_PROMPT_ANALYZE_TEXT,
+                        json_mode=True,
+                        max_tokens=4096,
+                    )
+                    sections = json.loads(response).get("sections", [])
+                    all_sections.extend(sections)
+                except (json.JSONDecodeError, RuntimeError) as e:
+                    console.print(
+                        f"  [yellow]Warning: Text batch {batch_num + 1} failed: {e}[/yellow]"
+                    )
+
+                start = end + 1
+                batch_num += 1
+                progress.advance(task)
+
+        if not all_sections:
+            # Fallback: create one section per page
+            console.print("  [yellow]No sections found. Creating per-page fallback.[/yellow]")
+            for page_num in range(doc.total_pages):
+                text = doc.get_page_text(page_num)
+                # Extract a brief summary from the first line
+                first_line = text.split("\n")[0] if text else f"Page {page_num + 1}"
+                all_sections.append({
+                    "title": first_line[:80],
+                    "start_page": page_num,
+                    "end_page": page_num,
+                    "level": 1,
+                    "summary": f"Data on page {page_num + 1}",
+                    "keywords": [],
+                })
+
+        # Text mode uses same coverage check
+        all_sections = self._ensure_coverage_text(all_sections, doc)
+        return self._deduplicate(all_sections)
+
+    def _ensure_coverage_text(self, sections: list[dict], doc: "LoadedDocument") -> list[dict]:
+        """Ensure sections cover all pages. Fill gaps with per-page entries."""
+        if not sections:
+            return [
+                {
+                    "title": f"Page {p + 1}",
+                    "start_page": p, "end_page": p, "level": 1,
+                    "summary": f"Data on page {p + 1}", "keywords": [],
+                }
+                for p in range(doc.total_pages)
+            ]
+
+        total = doc.total_pages
+        covered = set()
+        for s in sections:
+            for p in range(s.get("start_page", 0), s.get("end_page", 0) + 1):
+                covered.add(p)
+
+        coverage = len(covered) / total if total > 0 else 0
+        console.print(f"  Page coverage: {coverage:.0%} ({len(covered)}/{total} pages)")
+
+        if coverage >= 0.7:
+            return sections
+
+        # Fill uncovered pages
+        console.print(f"  [yellow]Low coverage ({coverage:.0%}). Filling gaps...[/yellow]")
+        uncovered = sorted(set(range(total)) - covered)
+
+        # Group consecutive uncovered pages
+        groups: list[tuple[int, int]] = []
+        g_start = uncovered[0]
+        for i in range(1, len(uncovered)):
+            if uncovered[i] != uncovered[i - 1] + 1:
+                groups.append((g_start, uncovered[i - 1]))
+                g_start = uncovered[i]
+        groups.append((g_start, uncovered[-1]))
+
+        for g_start, g_end in groups:
+            text = doc.get_pages_text_batch(g_start, g_end)
+            prompt = (
+                f"Analyze pages {g_start + 1}-{g_end + 1} of a "
+                f"{total}-page document.\n\n"
+                f"Content:\n{text[:4000]}\n\n"
+                f"Identify sections with specific summaries. Output valid JSON."
+            )
+            try:
+                response = self.llm.complete(
+                    prompt=prompt,
+                    model=self.config.model.indexing_model,
+                    system_prompt=SYSTEM_PROMPT_ANALYZE_TEXT,
+                    json_mode=True,
+                    max_tokens=2048,
+                )
+                new_sections = json.loads(response).get("sections", [])
+                sections.extend(new_sections)
+            except Exception:
+                # Absolute fallback: one section per page in the gap
+                for p in range(g_start, g_end + 1):
+                    sections.append({
+                        "title": f"Page {p + 1}",
+                        "start_page": p, "end_page": p, "level": 1,
+                        "summary": f"Data on page {p + 1}", "keywords": [],
+                    })
+
+        return sections
 
     def _ensure_coverage(self, sections: list[dict], pdf: LoadedPDF) -> list[dict]:
         """

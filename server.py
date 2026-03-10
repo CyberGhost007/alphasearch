@@ -23,6 +23,9 @@ from pydantic import BaseModel
 from treerag.config import TreeRAGConfig
 from treerag.pipeline import TreeRAGPipeline, ChatMessage
 from treerag.models import DocumentIndex
+from treerag.tabular_processor import SUPPORTED_TABULAR_EXTENSIONS
+
+SUPPORTED_EXTENSIONS = {".pdf"} | SUPPORTED_TABULAR_EXTENSIONS  # .pdf, .csv, .xlsx, .xls
 
 
 # ============================================================================
@@ -71,14 +74,17 @@ class FolderCreateRequest(BaseModel):
 @app.post("/api/single/upload")
 async def single_upload(file: UploadFile = File(...)):
     global single_doc_index, single_pdf_path, single_chat_history
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are supported")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(400, f"Unsupported file type '{ext}'. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
 
     save_path = UPLOAD_DIR / file.filename
     try:
         with open(save_path, "wb") as f:
             f.write(await file.read())
-        single_doc_index = pipeline.index(str(save_path))
+        # Generate an index save path so BM25 gets built for tabular files
+        index_save_path = UPLOAD_DIR / f"{Path(file.filename).stem}_tree.json"
+        single_doc_index = pipeline.index(str(save_path), save_path=str(index_save_path))
         single_pdf_path = str(save_path)
         single_chat_history = []
         return {"filename": file.filename, "pages": single_doc_index.total_pages, "description": single_doc_index.description, "status": "indexed"}
@@ -89,9 +95,11 @@ async def single_upload(file: UploadFile = File(...)):
 @app.post("/api/single/chat")
 def single_chat(req: ChatRequest):
     if not single_doc_index:
-        return {"answer": "No document uploaded yet. Upload a PDF first.", "sources": [], "stats": {}}
+        return {"answer": "No document uploaded yet. Upload a file first.", "sources": [], "stats": {}}
     try:
-        result = pipeline.query_document(req.query, single_doc_index, use_vision=True)
+        # Auto-detect: skip vision for tabular files (they use text-mode deep reads)
+        is_tabular = single_pdf_path and Path(single_pdf_path).suffix.lower() in SUPPORTED_TABULAR_EXTENSIONS
+        result = pipeline.query_document(req.query, single_doc_index, use_vision=not is_tabular)
         sources = [{"doc": s.document_filename, "section": s.node.title, "pages": s.node.page_range, "score": round(s.relevance_score, 3)} for s in result.sources]
         return {"answer": result.answer, "sources": sources, "stats": {"total": f"{result.latency_seconds:.1f}s", "calls": result.total_llm_calls, "cost": f"${pipeline.llm._estimate_cost():.4f}"}}
     except Exception as e:
@@ -148,8 +156,9 @@ def delete_folder(folder_name: str):
 
 @app.post("/api/folders/{folder_name}/documents")
 async def upload_folder_document(folder_name: str, file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are supported")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(400, f"Unsupported file type '{ext}'. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
     temp_path = UPLOAD_DIR / file.filename
     try:
         with open(temp_path, "wb") as f:
@@ -239,14 +248,14 @@ h1{font-family:'Instrument Sans',system-ui,sans-serif;font-size:36px;font-weight
 <div class="cards">
 <a href="/single" class="card">
 <div class="ci" style="background:rgba(59,130,246,.12);color:#3B82F6"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8zM14 2v6h6"/></svg></div>
-<h2>Single PDF</h2>
-<p>Upload one document, ask questions instantly. No setup needed.</p>
+<h2>Single File</h2>
+<p>Upload a PDF, CSV, or Excel file. Ask questions instantly.</p>
 <span class="badge" style="background:rgba(59,130,246,.12);color:#3B82F6">Quick start</span>
 </a>
 <a href="/folders" class="card">
 <div class="ci" style="background:rgba(139,92,246,.12);color:#8B5CF6"><svg viewBox="0 0 24 24"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg></div>
 <h2>Folders</h2>
-<p>Organize documents into folders. Auto-routes queries across all docs.</p>
+<p>Organize PDFs, CSVs & Excel files into folders. Auto-routes queries across all docs.</p>
 <span class="badge" style="background:rgba(139,92,246,.12);color:#8B5CF6">Full power</span>
 </a>
 </div>
@@ -272,7 +281,7 @@ def _serve_jsx(mode: str) -> HTMLResponse:
     jsx_code = f'const APP_MODE = "{mode}";\n' + jsx_path.read_text()
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AlphaSearch — {"Single PDF" if mode == "single" else "Folders"}</title>
+<title>AlphaSearch — {"Single File" if mode == "single" else "Folders"}</title>
 <style>body{{margin:0}}#root{{height:100vh}}</style></head><body><div id="root"></div>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>

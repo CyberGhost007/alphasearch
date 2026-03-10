@@ -11,7 +11,7 @@
 <br>
 <br>
 
-AlphaSearch replaces vector databases with **Monte Carlo Tree Search** — the same algorithm that powered AlphaGo — for document retrieval. Upload PDFs, ask questions, and the system finds the exact section containing the answer using LLM reasoning.
+AlphaSearch replaces vector databases with **Monte Carlo Tree Search** — the same algorithm that powered AlphaGo — for document retrieval. Upload PDFs, CSVs, or Excel files, ask questions, and the system finds the exact section containing the answer using LLM reasoning.
 
 **No vectors. No embeddings. No chunking. Just reasoning.**
 
@@ -21,13 +21,13 @@ AlphaSearch replaces vector databases with **Monte Carlo Tree Search** — the s
 
 ## Two Modes
 
-### 📄 Single PDF Mode
-Upload one document, ask questions instantly. No folders, no setup.
+### 📄 Single File Mode
+Upload one document (PDF, CSV, or Excel), ask questions instantly. No folders, no setup.
 
 **Pipeline:** Upload → Index → Phase 2 (MCTS section search) → Deep Read → Answer
 
 ### 📁 Folder Mode
-Organize documents into folders. The system auto-routes queries to the right folder, picks the right document, finds the right section.
+Organize documents into folders. Mix PDFs, CSVs, and Excel files. The system auto-routes queries to the right folder, picks the right document, finds the right section.
 
 **Pipeline:** Phase 0 (auto-route) → Phase 1 (doc selection) → Phase 2 (section search) → Deep Read → Answer
 
@@ -46,16 +46,16 @@ cp .env.example .env
 python server.py
 ```
 
-Open **http://localhost:8000** → pick Single PDF or Folders.
+Open **http://localhost:8000** → pick Single File or Folders.
 
-### Single PDF Mode (`/single`)
-1. Click **Manage** → upload a PDF
+### Single File Mode (`/single`)
+1. Click **Manage** → upload a PDF, CSV, or Excel file
 2. Wait for indexing
 3. Ask your question → get answer with citations
 
 ### Folder Mode (`/folders`)
 1. Click **Manage** → **New Folder** → name it
-2. Expand folder → **Upload PDFs**
+2. Expand folder → upload PDFs, CSVs, or Excel files
 3. Close sidebar → ask anything across all your documents
 
 ---
@@ -73,20 +73,22 @@ Single Mode:                           Folder Mode:
                                             │
                                        Phase 1 — Doc Selection
                                        MCTS on meta-tree
-                                       → budget.pdf, proposal.pdf
+                                       → budget.pdf, costs.csv
                                             │
 Phase 2 — Section Search              Phase 2 — Section Search (parallel)
 MCTS on document tree                 MCTS on each selected doc
-→ "Cost Summary" (pp.5-8)             → "Cost Summary" (pp.5-8)
+→ "Cost Summary" (pp.5-8)             PDF: UCB1    CSV: PUCT (BM25-guided)
      │                                      │
-Deep Read — GPT-4o Vision             Deep Read — GPT-4o Vision
-Reads actual page images              Reads actual page images
+Deep Read                              Deep Read
+PDF: GPT-4o Vision on page images     PDF: Vision | CSV: text mode
 → extracts $812,000                    → extracts $812,000
      │                                      │
 Answer with citations                 Answer with cross-doc citations
 ```
 
-The key insight: MCTS uses summaries for **navigation** (cheap, GPT-4o-mini) but reads the **original PDF pages** for answers (accurate, GPT-4o vision). Summaries are signposts, not the source.
+**The key insight:** MCTS uses summaries for **navigation** (cheap, GPT-4o-mini) but reads the **original source** for answers (accurate, GPT-4o). For PDFs, deep read uses page images (vision). For CSV/Excel, deep read uses markdown table text (cheaper, faster, lossless).
+
+**The AlphaGo parallel for tabular data:** BM25 acts as the "policy network" (fast keyword prior), LLM acts as the "value network" (slow semantic evaluation), and MCTS orchestrates both via the PUCT formula — the same selection algorithm used by AlphaGo and AlphaZero.
 
 ---
 
@@ -94,26 +96,37 @@ The key insight: MCTS uses summaries for **navigation** (cheap, GPT-4o-mini) but
 
 ### MCTS-Powered Search
 - **UCB1 formula** balances exploitation (high-scoring sections) and exploration (unvisited sections)
+- **PUCT selection** for tabular data — BM25 keyword scores as policy network prior (AlphaGo formula)
+- **Tiered execution** — BM25 clear winner? Skip MCTS entirely. Spread scores? PUCT-guided. No signal? Full UCB1.
 - **Backpropagation** — if a subsection scores high, its siblings become more likely to be explored
 - **Early stopping** — converges when confident, saving LLM calls
 - **Parallel Phase 2** — searches multiple documents simultaneously via ThreadPoolExecutor
 
+### Multi-Format Support
+- **PDF** — vision-based indexing (GPT-4o reads page images), UCB1 MCTS search
+- **CSV** — text-based indexing (markdown tables), BM25 + PUCT-guided MCTS search
+- **Excel (.xlsx/.xls)** — multi-sheet support, each sheet becomes a tree section
+- Custom BM25 tokenizer preserves emails, currency (`$125,000`), dates, phone numbers as atomic tokens
+
 ### Document Management
-- **Single mode:** Upload one PDF, ask questions, swap documents anytime
-- **Folder mode:** Create folders, upload multiple PDFs, auto-routing across all docs
+- **Single mode:** Upload one file (PDF/CSV/Excel), ask questions, swap anytime
+- **Folder mode:** Create folders, upload mixed file types, auto-routing across all docs
 - **Per-document caching** — MD5 hash comparison, unchanged files skip re-indexing
-- **Health check & repair** — detects missing PDFs, stale indices, orphaned files
+- **Health check & repair** — detects missing files, stale indices, missing BM25 indices, orphaned files
 
 ### Production-Ready
-- 13 custom exceptions covering every failure mode
+- 16 custom exceptions covering every failure mode (PDF + tabular)
 - PDF validation (magic bytes, corrupt, empty, too large, wrong extension)
+- CSV/Excel validation (corrupt, empty, too many rows, unsupported format)
 - Atomic file writes to prevent corruption on crash
 - Thread-safe folder operations with per-folder locks
 - Batch upload with partial failure handling
+- Lazy pandas import — server starts fine even without pandas (CSV features disabled gracefully)
 
 ### Chat Interface
-- Landing page to pick mode (Single PDF / Folders)
+- Landing page to pick mode (Single File / Folders)
 - Mode-appropriate sidebar (upload dropzone vs folder CRUD)
+- Supports PDF, CSV, and Excel uploads in both modes
 - Folder badge with confidence score on each response
 - Source cards with document, section, pages, and relevance score
 - Chat history context for follow-up questions
@@ -131,7 +144,7 @@ python main.py chat
 
 # Folder management
 python main.py folder create "My Project"
-python main.py folder add "My Project" report.pdf analysis.pdf
+python main.py folder add "My Project" report.pdf sales.csv budget.xlsx
 python main.py folder list
 python main.py folder info "My Project"
 python main.py folder health "My Project"
@@ -144,8 +157,10 @@ python main.py search-doc "My Project" report.pdf "What was Q3 revenue?"
 # Interactive mode
 python main.py interactive "My Project"
 
-# Standalone single PDF
+# Standalone single file (PDF, CSV, or Excel)
 python main.py query report.pdf "Summarize this document"
+python main.py query sales.csv "Top revenue region?"
+python main.py query budget.xlsx "Total Q3 spend?"
 
 # Inspect a tree index
 python main.py inspect .treerag_data/folders/project/indices/doc_tree.json
@@ -156,23 +171,27 @@ python main.py inspect .treerag_data/folders/project/indices/doc_tree.json
 ## Python API
 
 ```python
-from treerag.config import TreeRAGConfig
-from treerag.pipeline import TreeRAGPipeline
+from treerag import TreeRAGConfig, TreeRAGPipeline
 
 config = TreeRAGConfig.from_env()
 pipeline = TreeRAGPipeline(config)
 
-# --- Single document ---
+# --- Single document (PDF, CSV, or Excel) ---
 doc_index = pipeline.index("report.pdf")
 result = pipeline.query_document("What was Q3 revenue?", doc_index)
 print(result.answer)
 
-# --- Folder mode ---
+# CSV/Excel files get BM25 index automatically
+doc_index = pipeline.index("sales.csv", save_path="sales_tree.json")
+result = pipeline.query_document("Top revenue region?", doc_index)
+
+# --- Folder mode (mix file types) ---
 pipeline.folder.create_folder("project")
 pipeline.folder.add_document("project", "report.pdf")
-pipeline.folder.add_document("project", "appendix.pdf")
+pipeline.folder.add_document("project", "financials.csv")
+pipeline.folder.add_document("project", "budget.xlsx")
 
-# Auto-route chat
+# Auto-route chat (works across PDFs and tabular files)
 result = pipeline.chat("What was the total budget?")
 print(result.content)
 print(result.folder_name)
@@ -189,13 +208,13 @@ result = pipeline.query_folder("Phase 2 costs?", "project")
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Landing page (pick mode) |
-| `/single` | GET | Single PDF chat UI |
+| `/single` | GET | Single File chat UI |
 | `/folders` | GET | Folder mode chat UI |
 
 ### Single Mode
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/single/upload` | POST | Upload + index a PDF |
+| `/api/single/upload` | POST | Upload + index a file (PDF, CSV, Excel) |
 | `/api/single/chat` | POST | Query the uploaded document |
 | `/api/single/status` | GET | Check if a document is loaded |
 | `/api/single/reset` | POST | Clear document + chat history |
@@ -206,7 +225,7 @@ result = pipeline.query_folder("Phase 2 costs?", "project")
 | `/api/folders` | GET | List all folders |
 | `/api/folders` | POST | Create folder |
 | `/api/folders/{name}` | DELETE | Delete folder |
-| `/api/folders/{name}/documents` | POST | Upload + index PDF into folder |
+| `/api/folders/{name}/documents` | POST | Upload + index file (PDF, CSV, Excel) into folder |
 | `/api/folders/{name}/documents/{file}` | DELETE | Remove document |
 | `/api/folders/chat` | POST | Chat with auto-routing |
 | `/api/folders/chat/reset` | POST | Clear chat history |
@@ -255,14 +274,16 @@ alphasearch/
 ├── DOCUMENTATION.md       Full technical docs
 └── treerag/               Core package
     ├── config.py           Configuration
-    ├── exceptions.py       13 custom exceptions
-    ├── models.py           TreeNode, DocumentIndex, FolderIndex
+    ├── exceptions.py       16 custom exceptions (PDF + tabular)
+    ├── models.py           TreeNode (UCB1 + PUCT), DocumentIndex, FolderIndex
     ├── llm_client.py       OpenAI wrapper (text + vision)
     ├── pdf_processor.py    PDF validation + page rendering
-    ├── indexer.py          PDF → tree index (with coverage check)
-    ├── mcts.py             Two-phase MCTS engine (parallel)
+    ├── tabular_processor.py CSV/Excel → markdown table pages
+    ├── bm25.py             BM25 inverted index + PUCT tier detection
+    ├── indexer.py          Document → tree index (PDF vision + tabular text)
+    ├── mcts.py             MCTS engine (UCB1, PUCT, tiered BM25 search)
     ├── router.py           Phase 0 folder routing agent
-    ├── folder_manager.py   CRUD, caching, health checks
+    ├── folder_manager.py   CRUD, caching, health checks, BM25 lifecycle
     └── pipeline.py         Orchestration + chat() entry point
 ```
 
@@ -272,10 +293,15 @@ alphasearch/
 
 | Operation | Model | Calls | Cost |
 |-----------|-------|-------|------|
-| **Index 50-page PDF** | GPT-4o | ~8 | ~$0.35 (one-time) |
-| **Query (single doc)** | GPT-4o-mini + GPT-4o | ~29 | ~$0.04 |
+| **Index 50-page PDF** | GPT-4o (vision) | ~8 | ~$0.35 (one-time) |
+| **Index 2000-row CSV** | GPT-4o-mini (text) | ~6 | ~$0.02 (one-time) |
+| **Query PDF** | GPT-4o-mini + GPT-4o | ~29 | ~$0.04 |
+| **Query CSV (BM25 hit)** | GPT-4o only | ~4 | ~$0.02 |
+| **Query CSV (PUCT)** | GPT-4o-mini + GPT-4o | ~15 | ~$0.03 |
 | **Query (folder search)** | GPT-4o-mini + GPT-4o | ~97 | ~$0.05 |
 | **Infrastructure** | — | — | **$0** (no vector DB) |
+
+CSV/Excel queries are cheaper because BM25 pre-filters nodes before LLM evaluation. Tier 1 queries (exact keyword match) skip MCTS entirely.
 
 ---
 
@@ -297,12 +323,14 @@ After 25 iterations, top-scoring nodes are deep-read using GPT-4o vision on actu
 | | Vector RAG | PageIndex | **AlphaSearch** |
 |---|-----------|-----------|-----------------|
 | Retrieval | Cosine similarity | Greedy tree search | **MCTS (explore + exploit + backtrack)** |
-| Modes | Single | Single | **Single PDF + Folder mode** |
+| Modes | Single | Single | **Single File + Folder mode** |
+| File types | PDF | PDF | **PDF + CSV + Excel** |
 | Multi-document | Flat index | Limited | **Folder meta-tree + auto-routing** |
 | Chat context | None | None | **History-aware routing** |
 | Parallel search | N/A | No | **ThreadPoolExecutor** |
+| Text search | None | None | **BM25 inverted index (tabular)** |
 | Caching | Embedding cache | None | **MD5 hash per document** |
-| Error handling | Varies | Basic | **13 exceptions + health check** |
+| Error handling | Varies | Basic | **16 exceptions + health check** |
 | UI included | No | Paid | **React chat + landing page** |
 | Infrastructure | Vector DB ($70/mo+) | Paid API | **JSON files ($0)** |
 

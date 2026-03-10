@@ -2,6 +2,11 @@
 Two-Phase MCTS Engine.
 Phase 1: Score document summaries → pick top-K docs
 Phase 2: Search within selected docs → find sections (parallel)
+
+For tabular documents (CSV/Excel), Phase 2 uses BM25-guided tiered execution:
+  Tier 1: Clear BM25 winner → skip MCTS, direct deep read
+  Tier 2: Spread BM25 scores → PUCT-guided MCTS (BM25 as policy prior)
+  Tier 3: No BM25 signal → standard UCB1 MCTS (same as PDFs)
 """
 
 import json
@@ -14,6 +19,7 @@ from rich.console import Console
 from .config import MCTSConfig
 from .models import TreeNode, DocumentIndex, FolderIndex, FolderDocEntry, SearchResult, DocumentScore
 from .llm_client import LLMClient
+from .bm25 import BM25Index
 
 console = Console()
 
@@ -146,6 +152,136 @@ class MCTSEngine:
                 console.print(f"    [red]{idx.filename}: Error — {e}[/red]")
         all_results.sort(key=lambda r: r.relevance_score, reverse=True)
         return all_results[:self.config.top_k_results]
+
+    # =========================================================================
+    # BM25-Guided Tiered Search (for tabular documents)
+    # =========================================================================
+
+    def search_document_bm25(
+        self,
+        query: str,
+        doc_index: DocumentIndex,
+        bm25_index: BM25Index,
+        verbose: bool = True,
+    ) -> list[SearchResult]:
+        """
+        Search a tabular document using BM25 + tiered MCTS execution.
+
+        Tier 1: Direct deep read on BM25 winner (zero MCTS iterations)
+        Tier 2: PUCT-guided MCTS using BM25 priors
+        Tier 3: Standard UCB1 MCTS (same as PDFs)
+        """
+        if not doc_index.root:
+            return []
+
+        root = doc_index.root
+        root.reset_mcts_state()
+
+        # Score all nodes with BM25
+        tier, bm25_scores = bm25_index.detect_tier(query)
+
+        if verbose:
+            top_score = max(bm25_scores.values()) if bm25_scores else 0
+            console.print(
+                f"\n  [dim]Searching: {doc_index.filename} "
+                f"(Tier {tier}, BM25 top={top_score:.3f})[/dim]"
+            )
+
+        if tier == 1:
+            # Direct: return top BM25 leaves without MCTS
+            return self._tier1_direct(root, bm25_scores, doc_index)
+
+        if tier == 2:
+            # PUCT-guided MCTS
+            return self._tier2_puct(
+                query, root, bm25_scores, doc_index, verbose
+            )
+
+        # Tier 3: Standard UCB1 (same as search_document)
+        return self.search_document(query, doc_index, verbose)
+
+    def _tier1_direct(
+        self,
+        root: TreeNode,
+        bm25_scores: dict[str, float],
+        doc_index: DocumentIndex,
+    ) -> list[SearchResult]:
+        """Tier 1: Return top BM25 leaf nodes directly, zero MCTS iterations."""
+        leaves = self._get_all_leaves(root)
+
+        # Score and rank leaves by BM25
+        scored_leaves = []
+        for leaf in leaves:
+            score = bm25_scores.get(leaf.node_id, 0.0)
+            scored_leaves.append((leaf, score))
+        scored_leaves.sort(key=lambda x: x[1], reverse=True)
+
+        results = []
+        seen_pages: set[tuple[int, int]] = set()
+        for leaf, score in scored_leaves:
+            if len(results) >= self.config.top_k_results:
+                break
+            if score <= 0.0:
+                break
+            pr = (leaf.start_page, leaf.end_page)
+            if any(pr[0] <= e and pr[1] >= s for s, e in seen_pages):
+                continue
+            seen_pages.add(pr)
+            # Use BM25 score as relevance (scaled to 0-1)
+            results.append(SearchResult(
+                node=leaf,
+                relevance_score=min(score, 1.0),
+                visit_count=1,
+                document_filename=doc_index.filename,
+                document_id=doc_index.document_id,
+            ))
+
+        return results
+
+    def _tier2_puct(
+        self,
+        query: str,
+        root: TreeNode,
+        bm25_scores: dict[str, float],
+        doc_index: DocumentIndex,
+        verbose: bool,
+    ) -> list[SearchResult]:
+        """Tier 2: MCTS with PUCT selection using BM25 priors."""
+        for _ in range(self.config.iterations):
+            selected = self._select_puct(root, bm25_scores)
+            expanded = self._expand(selected)
+            target = expanded or selected
+            try:
+                reward = self._simulate_section(query, target)
+            except Exception:
+                reward = 0.3
+            self._backpropagate(target, reward)
+            if self._should_stop_early(root):
+                break
+
+        return self._collect_results(
+            root, doc_index.filename, doc_index.document_id
+        )
+
+    def _select_puct(
+        self, node: TreeNode, bm25_scores: dict[str, float]
+    ) -> TreeNode:
+        """Select node using PUCT (BM25 prior) instead of UCB1."""
+        current, depth = node, 0
+        while not current.is_leaf and depth < self.config.max_depth:
+            unvisited = [c for c in current.children if c.visit_count == 0]
+            if unvisited:
+                return current
+            # PUCT selection: use BM25 score as prior
+            current = max(
+                current.children,
+                key=lambda c: c.puct(
+                    bm25_scores.get(c.node_id, 0.0),
+                    self.config.exploration_constant,
+                ),
+            )
+            depth += 1
+        return current
 
     # =========================================================================
     # Core MCTS

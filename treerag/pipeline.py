@@ -14,7 +14,7 @@ from rich.table import Table
 from dataclasses import dataclass, field
 
 from .config import TreeRAGConfig
-from .models import DocumentIndex, FolderIndex, SearchResult, QueryResult
+from .models import DocumentIndex, FolderIndex, SearchResult, QueryResult, TreeNode
 from .llm_client import LLMClient
 from .indexer import Indexer
 from .mcts import MCTSEngine, SYSTEM_PROMPT_DEEP_READ, SYSTEM_PROMPT_ANSWER
@@ -22,7 +22,7 @@ from .folder_manager import FolderManager
 from .router import RouterAgent
 from .pdf_processor import PDFProcessor
 from .tabular_processor import TabularProcessor, SUPPORTED_TABULAR_EXTENSIONS
-from .tabular_indexer import TabularIndexer
+from .bm25 import BM25Index
 from .exceptions import EmptyFolderError, FolderNotFoundError
 
 
@@ -59,7 +59,6 @@ class TreeRAGPipeline:
         self.config = config
         self._llm = None
         self._indexer = None
-        self._tabular_indexer = None
         self._mcts = None
         self._router = None
         self.pdf_processor = PDFProcessor(dpi=config.indexer.image_dpi)
@@ -80,12 +79,6 @@ class TreeRAGPipeline:
         if self._indexer is None:
             self._indexer = Indexer(self.config, self.llm)
         return self._indexer
-
-    @property
-    def tabular_indexer(self):
-        if self._tabular_indexer is None:
-            self._tabular_indexer = TabularIndexer(self.config, self.llm)
-        return self._tabular_indexer
 
     @property
     def mcts(self):
@@ -269,12 +262,38 @@ class TreeRAGPipeline:
                 latency_seconds=time.time() - start_time, phase1_time=p1_time,
             )
 
-        # Phase 2
+        # Phase 2 — use BM25-guided search for documents that have BM25 indices
         p2_start = time.time()
-        if self.config.mcts.parallel_phase2 and len(doc_indices) > 1:
-            search_results = self.mcts.search_documents_parallel(query, doc_indices)
-        else:
-            search_results = self.mcts.search_documents_sequential(query, doc_indices)
+        bm25_docs = []
+        regular_docs = []
+        for idx in doc_indices:
+            if idx.has_bm25:
+                bm25_docs.append(idx)
+            else:
+                regular_docs.append(idx)
+
+        search_results = []
+
+        # Search BM25-enabled documents (tabular)
+        for idx in bm25_docs:
+            try:
+                bm25_idx = BM25Index.load(idx.bm25_index_path)
+                results = self.mcts.search_document_bm25(query, idx, bm25_idx)
+                search_results.extend(results)
+            except Exception as e:
+                console.print(f"    [yellow]{idx.filename}: BM25 search failed ({e}), falling back to UCB1[/yellow]")
+                regular_docs.append(idx)
+
+        # Search regular documents (PDFs) with standard MCTS
+        if regular_docs:
+            if self.config.mcts.parallel_phase2 and len(regular_docs) > 1:
+                regular_results = self.mcts.search_documents_parallel(query, regular_docs)
+            else:
+                regular_results = self.mcts.search_documents_sequential(query, regular_docs)
+            search_results.extend(regular_results)
+
+        search_results.sort(key=lambda r: r.relevance_score, reverse=True)
+        search_results = search_results[:self.config.mcts.top_k_results]
         p2_time = time.time() - p2_start
 
         if not search_results:
@@ -317,7 +336,14 @@ class TreeRAGPipeline:
             title="Query", border_style="cyan",
         ))
 
-        search_results = self.mcts.search_document(query, doc_index)
+        # Use BM25-guided search for tabular documents
+        if doc_index.has_bm25:
+            bm25_idx = BM25Index.load(doc_index.bm25_index_path)
+            search_results = self.mcts.search_document_bm25(
+                query, doc_index, bm25_idx
+            )
+        else:
+            search_results = self.mcts.search_document(query, doc_index)
 
         if not search_results:
             return QueryResult(
@@ -346,10 +372,68 @@ class TreeRAGPipeline:
     # =========================================================================
 
     def index(self, pdf_path, save_path=None):
+        """Index a document (PDF or CSV/Excel). Builds BM25 index for tabular files."""
         ext = Path(pdf_path).suffix.lower()
-        if ext in SUPPORTED_TABULAR_EXTENSIONS:
-            return self.tabular_indexer.index_document(pdf_path, save_path)
+        is_tabular = ext in SUPPORTED_TABULAR_EXTENSIONS
+
+        if is_tabular:
+            # Load with tabular processor, index with text mode
+            loaded = self.tabular_processor.load(pdf_path)
+            doc_index = self.indexer.index_document(
+                pdf_path, save_path=save_path,
+                use_vision=False, loaded_doc=loaded,
+            )
+            # Build BM25 index from the tree
+            if doc_index.root and save_path:
+                bm25_path = Path(save_path).with_suffix(".bm25.json")
+                bm25_idx = self._build_bm25_index(doc_index, pdf_path)
+                bm25_idx.save(bm25_path)
+                doc_index.bm25_index_path = str(bm25_path)
+                doc_index.save(save_path)
+                console.print(f"  [green]BM25 index:[/green] {bm25_idx}")
+            return doc_index
+
         return self.indexer.index_document(pdf_path, save_path)
+
+    def _build_bm25_index(self, doc_index: DocumentIndex, file_path) -> BM25Index:
+        """Build a BM25 index from a document's tree nodes + raw page text."""
+        node_texts: dict[str, str] = {}
+
+        if doc_index.root:
+            # Load file ONCE and pass to all nodes (avoids O(n_leaves) file parses)
+            try:
+                loaded = self._load_file(file_path)
+            except Exception:
+                loaded = None
+            try:
+                self._collect_node_texts(doc_index.root, node_texts, loaded)
+            finally:
+                if loaded:
+                    loaded.close()
+
+        return BM25Index().build(node_texts)
+
+    def _collect_node_texts(self, node: TreeNode, texts: dict, loaded_doc):
+        """Recursively collect text for each node for BM25 indexing."""
+        if node.is_leaf:
+            # Leaf: use raw page text from the loaded file (markdown table)
+            if loaded_doc:
+                try:
+                    page_texts = []
+                    for p in range(node.start_page, node.end_page + 1):
+                        if p < loaded_doc.total_pages:
+                            page_texts.append(loaded_doc.get_page_text(p))
+                    texts[node.node_id] = "\n".join(page_texts)
+                except Exception:
+                    texts[node.node_id] = f"{node.title} {node.summary} {' '.join(node.keywords)}"
+            else:
+                # Fallback to summary + keywords
+                texts[node.node_id] = f"{node.title} {node.summary} {' '.join(node.keywords)}"
+        else:
+            # Internal node: summary + keywords (written by LLM during indexing)
+            texts[node.node_id] = f"{node.title} {node.summary} {' '.join(node.keywords)}"
+            for child in node.children:
+                self._collect_node_texts(child, texts, loaded_doc)
 
     def load_index(self, index_path):
         doc_index = DocumentIndex.load(index_path)
@@ -366,7 +450,7 @@ class TreeRAGPipeline:
         for result in results:
             pdf_path = self._find_pdf(result, folder_name)
             if not pdf_path:
-                console.print(f"  [yellow]Skipping deep read for {result.node.title}: PDF missing[/yellow]")
+                console.print(f"  [yellow]Skipping deep read for {result.node.title}: source file missing[/yellow]")
                 continue
             self._deep_read_node(query, result, pdf_path, use_vision)
 
@@ -377,7 +461,7 @@ class TreeRAGPipeline:
         """Deep read for single-document search."""
         pdf_path = doc_index.pdf_path
         if not pdf_path or not Path(pdf_path).exists():
-            console.print("[yellow]PDF not found — skipping deep read, using summaries only[/yellow]")
+            console.print("[yellow]Source file not found — skipping deep read, using summaries only[/yellow]")
             return results
 
         for result in results:
@@ -402,8 +486,14 @@ class TreeRAGPipeline:
             console.print(f"  [yellow]Cannot open file for deep read: {e}[/yellow]")
             return
 
+        # Force text mode for tabular files — markdown tables are text,
+        # no need to render images and waste vision tokens
+        ext = Path(pdf_path).suffix.lower()
+        is_tabular = ext in SUPPORTED_TABULAR_EXTENSIONS
+        effective_vision = use_vision and not is_tabular
+
         try:
-            if use_vision:
+            if effective_vision:
                 images = doc.get_page_images_batch(node.start_page, node.end_page)
                 if not images:
                     doc.close()

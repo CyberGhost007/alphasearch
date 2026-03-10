@@ -77,6 +77,28 @@ class TreeNode:
             math.log(self.parent.visit_count) / self.visit_count
         )
 
+    def puct(self, bm25_prior: float, exploration_constant: float = 1.414) -> float:
+        """
+        PUCT selection (Predictor + UCB applied to Trees).
+        Same formula used by AlphaGo/AlphaZero.
+
+        bm25_prior acts as the "policy network" prior P(s,a):
+            PUCT = Q(s,a) + C * P(s,a) * sqrt(N(parent)) / (1 + N(child))
+
+        - Unvisited nodes with high prior → explored first
+        - As visits increase, exploitation (Q) dominates
+        - Zero prior → node only explored via exploitation
+        """
+        if self.visit_count == 0:
+            # Unvisited: prior determines order (not infinite like UCB1)
+            # Scale by exploration constant so it's comparable to exploited nodes
+            parent_visits = self.parent.visit_count if self.parent else 1
+            return exploration_constant * bm25_prior * math.sqrt(max(parent_visits, 1))
+        parent_visits = self.parent.visit_count if self.parent else 1
+        return self.average_reward + exploration_constant * bm25_prior * math.sqrt(
+            parent_visits
+        ) / (1.0 + self.visit_count)
+
     def reset_mcts_state(self):
         self.visit_count = 0
         self.total_reward = 0.0
@@ -137,6 +159,12 @@ class DocumentIndex:
     created_at: float = field(default_factory=time.time)
     file_hash: str = ""
     pdf_path: str = ""
+    bm25_index_path: str = ""   # Path to BM25 index file (tabular docs only)
+
+    @property
+    def has_bm25(self) -> bool:
+        """True if this document has a BM25 index (CSV/Excel files)."""
+        return bool(self.bm25_index_path) and Path(self.bm25_index_path).exists()
 
     def save(self, path: str | Path):
         data = {
@@ -144,6 +172,7 @@ class DocumentIndex:
             "total_pages": self.total_pages, "description": self.description,
             "created_at": self.created_at, "file_hash": self.file_hash,
             "pdf_path": self.pdf_path,
+            "bm25_index_path": self.bm25_index_path,
             "tree": self.root.to_dict() if self.root else None,
         }
         _atomic_write(Path(path), json.dumps(data, indent=2))
@@ -167,6 +196,7 @@ class DocumentIndex:
             created_at=data.get("created_at", 0),
             file_hash=data.get("file_hash", ""),
             pdf_path=data.get("pdf_path", ""),
+            bm25_index_path=data.get("bm25_index_path", ""),
         )
         if data.get("tree"):
             index.root = TreeNode.from_dict(data["tree"])

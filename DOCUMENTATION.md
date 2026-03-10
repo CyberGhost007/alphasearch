@@ -28,31 +28,35 @@
 
 ## Overview
 
-AlphaSearch replaces vector database retrieval with Monte Carlo Tree Search (MCTS). Instead of embedding chunks into vectors and doing cosine similarity, it builds a hierarchical tree index from documents and uses LLM reasoning to navigate it.
+AlphaSearch replaces vector database retrieval with Monte Carlo Tree Search (MCTS). Instead of embedding chunks into vectors and doing cosine similarity, it builds a hierarchical tree index from documents and uses LLM reasoning to navigate it. Supports PDFs, CSVs, and Excel files.
 
 The core insight: **similarity ≠ relevance**. Vector search finds text that *looks* similar. AlphaSearch finds text that actually *answers the question* — by reasoning about document structure like a human expert would.
+
+For tabular data (CSV/Excel), a second insight applies: **BM25 + MCTS mirrors AlphaGo's dual-network architecture**. BM25 acts as the "policy network" (fast keyword scoring to guide exploration), while the LLM acts as the "value network" (slower semantic evaluation). Combined via the PUCT formula, this searches tabular data efficiently — exact lookups resolve instantly via BM25, semantic queries benefit from LLM-guided MCTS.
 
 ---
 
 ## Two Modes
 
-### Single PDF Mode (`/single`)
+### Single File Mode (`/single`)
 
-Upload one PDF, ask questions. No folders, no routing, no setup.
+Upload one file (PDF, CSV, or Excel), ask questions. No folders, no routing, no setup.
 
 ```
-Upload PDF → Index (GPT-4o reads pages) → Ask question
-    → Phase 2 (MCTS section search) → Deep Read → Answer
+Upload file → Index → Ask question → Phase 2 (MCTS section search) → Deep Read → Answer
+
+PDF:       GPT-4o reads page images → tree index → UCB1 MCTS → vision deep read
+CSV/Excel: pandas → markdown tables → same indexer → BM25 index → PUCT MCTS → text deep read
 ```
 
 Best for: Quick analysis of individual documents, one-off queries, demos.
 
 ### Folder Mode (`/folders`)
 
-Organize documents into folders. The system auto-routes queries to the right folder, picks the right document, finds the right section.
+Organize documents into folders. Supports mixed file types (PDFs alongside CSVs and Excel files). The system auto-routes queries to the right folder, picks the right document, finds the right section.
 
 ```
-Create folders → Upload PDFs → Ask question
+Create folders → Upload files (PDF, CSV, Excel) → Ask question
     → Phase 0 (route to folder) → Phase 1 (select docs)
     → Phase 2 (find sections, parallel) → Deep Read → Answer
 ```
@@ -62,12 +66,12 @@ Best for: Teams with multiple projects, cross-document search, ongoing use.
 ### What's Shared
 
 Both modes use the exact same core engine:
-- Same MCTS algorithm (UCB1 select → expand → simulate → backpropagate)
-- Same indexer (GPT-4o vision → tree with coverage check)
-- Same deep read (actual page images → GPT-4o extraction)
+- Same MCTS algorithm (UCB1 for PDFs, PUCT with BM25 prior for tabular)
+- Same indexer (GPT-4o reads content → tree with coverage check)
+- Same deep read (vision for PDFs, text for CSV/Excel)
 - Same answer generation (citations with doc/section/page)
 
-Single mode just skips Phase 0 and Phase 1.
+Single mode just skips Phase 0 and Phase 1. File type (PDF vs CSV/Excel) determines the processing path, not the mode.
 
 ---
 
@@ -79,7 +83,7 @@ Single mode just skips Phase 0 and Phase 1.
 │                                                                     │
 │  Landing Page (/)                                                   │
 │  ┌──────────────────┐  ┌──────────────────┐                         │
-│  │  📄 Single PDF    │  │  📁 Folders       │                         │
+│  │  📄 Single File   │  │  📁 Folders       │                         │
 │  │  /single          │  │  /folders         │                         │
 │  └────────┬─────────┘  └────────┬─────────┘                         │
 │           │                      │                                   │
@@ -105,9 +109,12 @@ Single mode just skips Phase 0 and Phase 1.
 │  │                                │                            │     │
 │  │  Phase 2 ────────────── Phase 2 (parallel)                  │     │
 │  │  MCTS on doc tree       MCTS on each selected doc           │     │
+│  │  (UCB1 for PDF,         (UCB1 for PDF,                      │     │
+│  │   PUCT+BM25 for CSV)    PUCT+BM25 for CSV)                 │     │
 │  │       │                      │                              │     │
 │  │  Deep Read ──────────── Deep Read                           │     │
-│  │  GPT-4o vision          GPT-4o vision                       │     │
+│  │  (vision for PDF,       (vision for PDF,                    │     │
+│  │   text for CSV/Excel)    text for CSV/Excel)                │     │
 │  │       │                      │                              │     │
 │  │  Answer ────────────── Answer                               │     │
 │  └─────────────────────────────────────────────────────────────┘     │
@@ -118,8 +125,9 @@ Single mode just skips Phase 0 and Phase 1.
 │  │  └── folders/                                               │     │
 │  │      ├── project_zenith/                                    │     │
 │  │      │   ├── folder_index.json  ← meta-tree                │     │
-│  │      │   ├── indices/           ← per-doc trees             │     │
-│  │      │   └── pdfs/              ← uploaded originals        │     │
+│  │      │   ├── indices/           ← per-doc trees + .bm25    │     │
+│  │      │   ├── pdfs/              ← uploaded PDFs             │     │
+│  │      │   └── files/             ← uploaded CSV/Excel        │     │
 │  │      └── client_onboarding/                                 │     │
 │  └─────────────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -138,16 +146,18 @@ alphasearch/
 ├── README.md              Quick-start guide
 ├── DOCUMENTATION.md       This file
 └── treerag/               Core package
-    ├── __init__.py
+    ├── __init__.py         Public API exports
     ├── config.py           ModelConfig, MCTSConfig, IndexerConfig, FolderConfig
-    ├── exceptions.py       13 custom exceptions
+    ├── exceptions.py       16 custom exceptions (PDF + tabular)
     ├── models.py           TreeNode, DocumentIndex, FolderIndex, SearchResult
     ├── llm_client.py       OpenAI wrapper (text + vision, retry, tracking)
     ├── pdf_processor.py    PDF validation + page rendering
-    ├── indexer.py          PDF → tree (coverage check, per-page fallback)
-    ├── mcts.py             Two-phase MCTS (meta + per-doc, parallel)
+    ├── tabular_processor.py CSV/Excel → markdown table pages (LoadedTabular)
+    ├── bm25.py             BM25 inverted index for tabular text search
+    ├── indexer.py          Content → tree (handles both PDF and tabular pages)
+    ├── mcts.py             Two-phase MCTS (UCB1 for PDF, PUCT+BM25 for tabular)
     ├── router.py           Phase 0 folder routing agent
-    ├── folder_manager.py   CRUD, caching, health check, thread safety
+    ├── folder_manager.py   CRUD, caching, health check, BM25 lifecycle, thread safety
     └── pipeline.py         Orchestration, chat(), query_folder(), query_document()
 ```
 
@@ -171,21 +181,36 @@ Cost: ~15 GPT-4o-mini calls (~$0.002)
 
 Full MCTS on each document's internal tree. 25 iterations. In folder mode, runs in parallel across selected documents via ThreadPoolExecutor.
 
-This is where the core MCTS algorithm operates — UCB1 selection, random expansion, LLM simulation, backpropagation. Early stopping when confident.
+**For PDFs:** Standard UCB1 selection → random expansion → LLM simulation → backpropagation. Early stopping when confident.
 
-Cost: ~25 GPT-4o-mini calls per document (~$0.003/doc)
+**For CSV/Excel:** Three-tier execution based on BM25 signal strength:
+
+| Tier | Condition | Behavior | LLM Calls |
+|------|-----------|----------|-----------|
+| **Tier 1: BM25 Clear Winner** | Top score ≥ 2× runner-up | Skip MCTS entirely, return BM25 result | 0 |
+| **Tier 2: BM25 Spread** | Scores vary, no clear winner | PUCT-guided MCTS (BM25 as prior P) | Reduced |
+| **Tier 3: No BM25 Signal** | All scores near zero | Standard UCB1 MCTS (same as PDF) | Full 25 |
+
+The tiered approach means exact lookups (names, emails, IDs) resolve instantly via Tier 1, keyword queries use Tier 2 with fewer LLM calls, and semantic queries fall through to full MCTS.
+
+Cost: ~0-25 GPT-4o-mini calls per document (~$0.00-$0.003/doc)
 
 ### Deep Read + Answer (Both Modes)
 
-Top 3 matched sections → send their actual page images to GPT-4o → extract specific data. A final GPT-4o call synthesizes the answer with citations.
+Top 3 matched sections → extract specific data → synthesize answer with citations.
 
-Cost: ~4 GPT-4o calls (~$0.04)
+**For PDFs:** Send actual page images to GPT-4o (vision mode).
+**For CSV/Excel:** Send markdown table text to GPT-4o (text mode — cheaper, faster, lossless).
+
+Cost: ~4 GPT-4o calls (~$0.04 for PDF, ~$0.01 for CSV/Excel)
 
 ### Cost Summary
 
 | Mode | Phases | LLM Calls | Cost |
 |------|--------|-----------|------|
-| Single PDF | Phase 2 + Deep Read | ~29 | ~$0.04 |
+| Single PDF | Phase 2 (UCB1) + Deep Read (vision) | ~29 | ~$0.04 |
+| Single CSV/Excel (exact match) | BM25 Tier 1 + Deep Read (text) | ~4 | ~$0.01 |
+| Single CSV/Excel (keyword) | BM25 Tier 2 (PUCT) + Deep Read (text) | ~15 | ~$0.02 |
 | Folder (3 docs) | Phase 0+1+2 + Deep Read | ~97 | ~$0.05 |
 
 ---
@@ -213,6 +238,24 @@ UCB1(node) = Q(node) + C × √(ln(N_parent) / N_node)
 
 **4. Backpropagate** — Propagate score upward to all ancestors. If subsection scores 0.9, parent chapter gets +0.9, making siblings more likely to be explored.
 
+### PUCT Formula (CSV/Excel)
+
+For tabular data, BM25 provides a prior probability `P` that guides MCTS exploration:
+
+```
+PUCT(node) = Q(node)/N(node) + C × P × √(N_parent) / (1 + N_node)
+              ├─ exploit ──┤   ├────────── explore ──────────┤
+```
+
+- **Q/N:** Average relevance score (same as UCB1 exploit term).
+- **P:** Normalized BM25 score for this node against the query. High P = BM25 thinks this node's text matches.
+- **C × P × √(N_parent) / (1+N):** Exploration term modulated by BM25 prior. Nodes with high BM25 scores get explored first.
+
+This mirrors AlphaGo's architecture exactly:
+- **Policy network** → BM25 (fast, ~1ms, suggests promising moves)
+- **Value network** → LLM (slow, ~200ms, evaluates positions accurately)
+- **MCTS** → Combines both via PUCT (same formula AlphaGo uses)
+
 ### Why MCTS Beats Alternatives
 
 | Approach | Weakness | MCTS Advantage |
@@ -234,19 +277,20 @@ Each folder has a lightweight meta-tree (document summaries) and independent per
 
 | Operation | What Happens |
 |-----------|-------------|
-| Create folder | Directory + folder_index.json |
-| Add document | Validate → copy → index → summary → meta-tree update |
+| Create folder | Directory + folder_index.json + `pdfs/` + `files/` + `indices/` |
+| Add PDF | Validate → copy to `pdfs/` → vision index → summary → meta-tree update |
+| Add CSV/Excel | Validate → copy to `files/` → text index → BM25 index → summary → meta-tree |
 | Add unchanged file | Hash match → skipped (cached) |
-| Add changed file | Hash mismatch → re-index → replace entry |
-| Remove document | Meta-tree entry + index + PDF deleted |
-| Health check | Detects missing PDFs, stale indices, orphans |
-| Repair | Re-indexes stale, removes orphans |
+| Add changed file | Hash mismatch → re-index (+ rebuild BM25 if tabular) → replace entry |
+| Remove document | Meta-tree entry + index + BM25 index + source file deleted |
+| Health check | Detects missing files, stale indices, orphans, missing BM25 for tabular |
+| Repair | Re-indexes stale, removes orphans, rebuilds missing BM25 |
 
 ---
 
 ## Edge Case Handling
 
-### File Validation
+### PDF Validation
 
 | Edge Case | Exception |
 |-----------|-----------|
@@ -262,6 +306,23 @@ Each folder has a lightweight meta-tree (document summaries) and independent per
 | Corrupt page | Skipped with warning |
 | Access after close | `RuntimeError` |
 
+### CSV/Excel Validation
+
+| Edge Case | Exception |
+|-----------|-----------|
+| File not found | `FileNotFoundError` |
+| Not a file | `InvalidTabularError` |
+| Unsupported extension | `InvalidTabularError` |
+| Empty (0 bytes) | `InvalidTabularError` |
+| Cannot parse | `InvalidTabularError` |
+| No columns | `EmptyTabularError` |
+| No data rows | `EmptyTabularError` |
+| All sheets empty (Excel) | `EmptyTabularError` |
+| >100,000 rows | `FileTooLargeError` |
+| >50,000 rows | Warning (`is_large` flag) |
+| pandas not installed | `ImportError` (lazy — only when CSV/Excel used) |
+| Access after close | `RuntimeError` |
+
 ### Folder Operations
 
 | Edge Case | Handling |
@@ -275,10 +336,11 @@ Each folder has a lightweight meta-tree (document summaries) and independent per
 | Batch: partial failure | Continues, reports all |
 | Disk full | Atomic write, cleanup |
 | Index manually deleted | Detected by health check |
-| PDF deleted | Detected by health check |
+| Source file deleted | Detected by health check |
+| BM25 index missing (tabular) | Detected by health check, rebuilt on repair |
 | Concurrent writes | Per-folder thread locks |
 | Empty folder search | `EmptyFolderError` |
-| Deep read missing PDF | Warning, uses summaries |
+| Deep read missing file | Warning, uses summaries |
 
 ---
 
@@ -286,12 +348,14 @@ Each folder has a lightweight meta-tree (document summaries) and independent per
 
 Every document tracked by MD5 hash:
 - Same hash → skip (instant)
-- Different hash → re-index only that file
+- Different hash → re-index only that file (+ rebuild BM25 if tabular)
 - New file → index only the new file
+
+BM25 indices stored alongside tree indices as `.bm25.json` files. Rebuilt automatically when the source file changes.
 
 Folder summaries (Router Agent) cached in memory per session.
 
-Storage: ~5-20KB per document index.
+Storage: ~5-20KB per document tree index, ~2-10KB per BM25 index (tabular only).
 
 ---
 
@@ -315,15 +379,15 @@ Disable with `PARALLEL_PHASE2=false`.
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Landing page (pick Single or Folder mode) |
-| `/single` | GET | Single PDF chat UI |
+| `/single` | GET | Single File chat UI |
 | `/folders` | GET | Folder mode chat UI |
 
 ### Single Mode
 
-**`POST /api/single/upload`** — Upload + index a PDF
+**`POST /api/single/upload`** — Upload + index a file (PDF, CSV, or Excel)
 ```
 Content-Type: multipart/form-data
-Body: file=@document.pdf
+Body: file=@document.pdf  (or data.csv, report.xlsx)
 Response: {"filename": "doc.pdf", "pages": 42, "description": "...", "status": "indexed"}
 ```
 
@@ -357,7 +421,7 @@ Request: {"name": "Project Zenith"}
 
 **`DELETE /api/folders/{name}`** — Delete folder
 
-**`POST /api/folders/{name}/documents`** — Upload + index PDF into folder
+**`POST /api/folders/{name}/documents`** — Upload + index file (PDF, CSV, Excel) into folder
 ```
 Content-Type: multipart/form-data
 Body: file=@document.pdf
@@ -385,7 +449,7 @@ Response: {"answer": "...", "folder": "Project Zenith", "sources": [...], "stats
 ## Module Reference
 
 ### server.py
-Landing page at `/`. Injects `APP_MODE` ("single" or "folders") into chat_ui.jsx. Separate state and APIs for each mode. Serves UI via Babel standalone (no build step).
+Landing page at `/`. Injects `APP_MODE` ("single" or "folders") into chat_ui.jsx. Separate state and APIs for each mode. Serves UI via Babel standalone (no build step). Auto-detects tabular files and uses text-mode deep reads (skips vision) for CSV/Excel.
 
 ### chat_ui.jsx
 Reads `APP_MODE` to switch between `SingleSidebar` (upload dropzone, doc info, reset) and `FolderSidebar` (folder CRUD, multi-doc). Shared components: Msg, Source, Phase, Md, Welcome. API client switches endpoints based on mode.
@@ -397,7 +461,7 @@ CLI commands: `chat` (unified auto-route), `interactive` (folder-specific), `fol
 `ModelConfig`, `MCTSConfig`, `IndexerConfig`, `FolderConfig`. All loadable from `.env`.
 
 ### exceptions.py
-13 exceptions: `InvalidFileError`, `CorruptPDFError`, `EmptyPDFError`, `FileTooLargeError`, `FolderNotFoundError`, `FolderAlreadyExistsError`, `DocumentNotFoundError`, `IndexNotFoundError`, `IndexCorruptError`, `PDFMissingError`, `IndexingFailedError`, `BatchIndexingError`, `EmptyFolderError`.
+16 exceptions: `InvalidFileError`, `CorruptPDFError`, `EmptyPDFError`, `FileTooLargeError`, `FolderNotFoundError`, `FolderAlreadyExistsError`, `DocumentNotFoundError`, `IndexNotFoundError`, `IndexCorruptError`, `PDFMissingError`, `IndexingFailedError`, `BatchIndexingError`, `EmptyFolderError`, `InvalidTabularError`, `EmptyTabularError`, `TreeRAGError` (base).
 
 ### models.py
 `TreeNode` (UCB1, MCTS state), `DocumentIndex`, `FolderIndex`, `FolderDocEntry`, `SearchResult`, `QueryResult`. Atomic writes via temp+rename.
@@ -408,20 +472,26 @@ OpenAI wrapper: `complete()` (text), `complete_with_images()` (vision), retry wi
 ### pdf_processor.py
 `validate()` (magic bytes, pages, size), `load()` → `LoadedPDF` (safe page access, corrupt page skip, close-state detection).
 
+### tabular_processor.py
+`TabularProcessor`: `validate()` (extension, parse check, row count, size), `load()` → `LoadedTabular`. Same interface as `LoadedPDF` (`total_pages`, `get_page_text()`, `get_page_image()`, batch accessors, context manager). Pandas/matplotlib are lazy-imported — only loaded when a CSV/Excel file is actually processed. Server starts fine without pandas if only PDFs are used.
+
+### bm25.py
+`BM25Index`: Inverted index with Okapi BM25 scoring (k1=1.5, b=0.75). `build(node_texts)` builds the index from leaf node text. `score_all(query)` returns normalized scores for all nodes. `save()`/`load()` for persistence as `.bm25.json`. Custom tokenizer handles tabular content (splits on pipes, preserves emails/URLs, normalizes numbers).
+
 ### indexer.py
-`index_document()`: Batch pages → GPT-4o vision → sections → tree. Coverage check (70% threshold). Per-page fallback for slides/presentations. `generate_document_summary()` for meta-tree.
+`index_document()`: Batch pages → GPT-4o → sections → tree. Works identically for both PDF pages and markdown table pages. Coverage check (70% threshold). Per-page fallback for slides/presentations. `generate_document_summary()` for meta-tree.
 
 ### mcts.py
-`search_meta()`: Phase 1. `search_document()`: Phase 2. `search_documents_parallel()`: Parallel Phase 2 with timeout. Core MCTS: select, expand, simulate, backpropagate.
+`search_meta()`: Phase 1. `search_document()`: Phase 2. `search_documents_parallel()`: Parallel Phase 2 with timeout. Core MCTS: select, expand, simulate, backpropagate. Supports two selection modes: UCB1 (PDFs) and PUCT with BM25 prior (tabular). Three-tier execution for tabular: Tier 1 (BM25 instant), Tier 2 (PUCT-guided), Tier 3 (standard UCB1).
 
 ### router.py
 `route()`: Phase 0. Scores folder summaries + chat history. Cached summaries. Keyword fallback.
 
 ### folder_manager.py
-CRUD with validation, atomic writes, hash caching, batch add, health check (5 issue types), repair, thread-safe.
+CRUD with validation, atomic writes, hash caching, batch add, health check (6 issue types including missing BM25), repair, thread-safe. Dispatches to PDF or tabular processor by file extension. Manages BM25 index lifecycle (create on add, delete on remove, rebuild on repair).
 
 ### pipeline.py
-`chat()`: Unified (Route → query_folder). `query_folder()`: Phase 1+2+deep read. `query_document()`: Phase 2+deep read (used by single mode). `ChatMessage` dataclass. Lazy init.
+`chat()`: Unified (Route → query_folder). `query_folder()`: Phase 1+2+deep read. `query_document()`: Phase 2+deep read (used by single mode). Dispatches processor by file extension. Loads file once for BM25 index building (not per-leaf). `ChatMessage` dataclass. Lazy init.
 
 ---
 
@@ -434,7 +504,7 @@ python main.py chat               # Unified chat (auto-routes)
 python main.py interactive "Proj" # Folder-specific interactive
 
 python main.py folder create "Proj"
-python main.py folder add "Proj" a.pdf b.pdf
+python main.py folder add "Proj" a.pdf b.pdf data.csv report.xlsx
 python main.py folder list
 python main.py folder info "Proj"
 python main.py folder health "Proj"
@@ -444,8 +514,11 @@ python main.py folder delete "Proj"
 
 python main.py search "Proj" "budget?"
 python main.py search-doc "Proj" budget.pdf "Phase 2?"
+python main.py search-doc "Proj" sales.csv "Q3 revenue?"
 
 python main.py query report.pdf "Summary?"
+python main.py query sales_data.csv "Top customers?"
+python main.py query financials.xlsx "Total expenses?"
 python main.py inspect path/to/index.json
 ```
 
@@ -488,27 +561,38 @@ AUTO_REINDEX=true
 
 ## Full Walkthrough
 
-### Single Mode
+### Single Mode — PDF
 ```bash
 python server.py → http://localhost:8000/single
 # Upload report.pdf (50 pages) → Indexed in ~30s
 # Ask: "What were the Q3 results?"
-# → Phase 2: MCTS finds "Q3 Financial Results" (pp.12-15)
+# → Phase 2: MCTS (UCB1) finds "Q3 Financial Results" (pp.12-15)
 # → Deep Read: GPT-4o reads pages 12-15 images
 # → Answer: "Q3 revenue was $4.2M, up 15%..."
 # → Source: [report.pdf → Q3 Financial Results, pp.12-15] [92%]
 # → Stats: 3.2s | 29 calls | $0.04
 ```
 
+### Single Mode — CSV
+```bash
+python server.py → http://localhost:8000/single
+# Upload sales_data.csv (2,400 rows) → Indexed in ~15s + BM25 built
+# Ask: "john@acme.com purchase history"
+# → BM25 Tier 1: Clear match on rows mentioning john@acme.com
+# → Deep Read: GPT-4o reads matching markdown table (text mode)
+# → Answer: "John Smith (john@acme.com) made 12 purchases totaling $45K..."
+# → Stats: 1.1s | 4 calls | $0.01
+```
+
 ### Folder Mode
 ```bash
 python server.py → http://localhost:8000/folders
-# Create "Project Zenith" → Upload proposal.pdf, budget.pdf
+# Create "Project Zenith" → Upload proposal.pdf, budget.pdf, expenses.csv
 # Ask: "What was the total project cost?"
 # → Phase 0: Routes to "Project Zenith" (94%)
-# → Phase 1: Selects budget.pdf, proposal.pdf
-# → Phase 2: Finds "Cost Summary" (pp.5-8), parallel
-# → Deep Read: GPT-4o reads pages 5-8 images
+# → Phase 1: Selects budget.pdf, expenses.csv
+# → Phase 2: Finds "Cost Summary" (pp.5-8) in PDF, BM25 matches in CSV
+# → Deep Read: vision for PDF, text for CSV
 # → Answer: "Total cost is $812,000 across 3 phases..."
 # → Source: [budget.pdf → Cost Summary, pp.5-8] [94%]
 # → Stats: 5.1s | 34 calls | $0.06
@@ -523,7 +607,13 @@ python server.py → http://localhost:8000/folders
 | Index 10-page PDF | ~$0.10 |
 | Index 50-page PDF | ~$0.35 |
 | Index 100-page PDF | ~$0.60 |
-| Query (single doc) | ~$0.04 |
+| Index 500-row CSV | ~$0.04 |
+| Index 2,000-row CSV | ~$0.12 |
+| Index 10,000-row CSV | ~$0.50 |
+| Query PDF (single doc) | ~$0.04 |
+| Query CSV (exact match, Tier 1) | ~$0.01 |
+| Query CSV (keyword, Tier 2) | ~$0.02 |
+| Query CSV (semantic, Tier 3) | ~$0.03 |
 | Query (folder, 3 docs) | ~$0.05 |
 | Infrastructure | **$0** |
 
@@ -534,12 +624,14 @@ python server.py → http://localhost:8000/folders
 | | Vector RAG | PageIndex | **AlphaSearch** |
 |---|-----------|-----------|-----------------|
 | Modes | Single | Single | **Single + Folder** |
-| Retrieval | Cosine similarity | Greedy tree | **MCTS (explore+exploit+backtrack)** |
+| File types | PDF only | PDF only | **PDF + CSV + Excel** |
+| Retrieval | Cosine similarity | Greedy tree | **MCTS (UCB1 + PUCT w/ BM25)** |
+| Text search | None | None | **BM25 inverted index (tabular)** |
 | Multi-doc | Flat index | Limited | **Meta-tree + auto-routing** |
 | Chat context | None | None | **History-aware routing** |
 | Parallel | No | No | **ThreadPoolExecutor** |
 | Caching | Embedding | None | **MD5 per document** |
-| Error handling | Varies | Basic | **13 exceptions + health check** |
+| Error handling | Varies | Basic | **16 exceptions + health check** |
 | UI | None | Paid | **React chat + landing page** |
 | Infrastructure | Vector DB ($70/mo+) | Paid API | **JSON files ($0)** |
 
@@ -553,17 +645,19 @@ python server.py → http://localhost:8000/folders
 3. No cross-document reference following
 4. No query result caching
 5. Server-side chat history (resets on restart)
+6. BM25 is English-optimized (tokenizer assumes English stop words)
 
 ### Planned
 1. Multi-model support (Gemini, Claude, local)
 2. Cross-document reference following
 3. Query result caching
 4. Streaming answers
-5. Keyword pre-filter before MCTS
+5. BM25 for PDFs (currently tabular-only — would benefit keyword-heavy PDF queries)
 6. Nested folder hierarchy
 7. Persistent chat history (SQLite)
 8. WebSocket for real-time phase progress
 9. Authentication and multi-user
+10. Multi-language BM25 tokenization
 
 ---
 
