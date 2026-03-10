@@ -1,10 +1,21 @@
-# 🔍 AlphaSearch
+<div align="center">
 
-**AlphaGo-inspired MCTS for Document Retrieval**
+# AlphaSearch
 
-AlphaSearch replaces vector databases with Monte Carlo Tree Search — the same algorithm that powered AlphaGo — for document retrieval. Upload PDFs, ask questions, and the system finds the exact section containing the answer using LLM reasoning.
+### AlphaGo-inspired MCTS for Document Retrieval
+
+<br>
+
+<img src="assets/banner.png" alt="AlphaSearch Banner" width="800">
+
+<br>
+<br>
+
+AlphaSearch replaces vector databases with **Monte Carlo Tree Search** — the same algorithm that powered AlphaGo — for document retrieval. Upload PDFs, ask questions, and the system finds the exact section containing the answer using LLM reasoning.
 
 **No vectors. No embeddings. No chunking. Just reasoning.**
+
+</div>
 
 ---
 
