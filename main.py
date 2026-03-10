@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 TreeRAG CLI — Folder-based, MCTS-powered document retrieval.
+Supports PDF, CSV, and Excel (.xlsx/.xls) files.
 
 Folder management:
     python main.py folder create "Project Alpha"
-    python main.py folder add "Project Alpha" doc1.pdf doc2.pdf
+    python main.py folder add "Project Alpha" doc1.pdf data.csv sales.xlsx
     python main.py folder list
     python main.py folder info "Project Alpha"
     python main.py folder remove "Project Alpha" doc1.pdf
@@ -19,6 +20,7 @@ Search:
 
 Standalone:
     python main.py query report.pdf "What was Q3 revenue?"
+    python main.py query sales.csv "Top revenue region?"
     python main.py inspect .treerag_data/folders/project/indices/doc_tree.json
 """
 
@@ -67,7 +69,7 @@ def cmd_folder(args):
 
     elif args.action == "add":
         if not args.name or not args.files:
-            console.print("[red]Usage: folder add <name> file1.pdf file2.pdf ...[/red]")
+            console.print("[red]Usage: folder add <name> file1.pdf file2.csv ...[/red]")
             return
         if len(args.files) == 1:
             fm.add_document(args.name, args.files[0])
@@ -76,7 +78,7 @@ def cmd_folder(args):
 
     elif args.action == "remove":
         if not args.name or not args.files:
-            console.print("[red]Usage: folder remove <name> filename.pdf[/red]")
+            console.print("[red]Usage: folder remove <name> filename[/red]")
             return
         for f in args.files:
             fm.remove_document(args.name, f)
@@ -326,7 +328,7 @@ def main():
     ))
 
     # query (standalone)
-    p = subparsers.add_parser("query", help="Standalone: index + query a PDF")
+    p = subparsers.add_parser("query", help="Standalone: index + query a file (PDF, CSV, Excel)")
     p.add_argument("pdf_path"); p.add_argument("query"); p.add_argument("--index"); p.add_argument("--no-vision", action="store_true")
     p.set_defaults(func=cmd_query)
 

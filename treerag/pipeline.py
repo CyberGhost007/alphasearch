@@ -21,6 +21,8 @@ from .mcts import MCTSEngine, SYSTEM_PROMPT_DEEP_READ, SYSTEM_PROMPT_ANSWER
 from .folder_manager import FolderManager
 from .router import RouterAgent
 from .pdf_processor import PDFProcessor
+from .tabular_processor import TabularProcessor, SUPPORTED_TABULAR_EXTENSIONS
+from .tabular_indexer import TabularIndexer
 from .exceptions import EmptyFolderError, FolderNotFoundError
 
 
@@ -57,9 +59,11 @@ class TreeRAGPipeline:
         self.config = config
         self._llm = None
         self._indexer = None
+        self._tabular_indexer = None
         self._mcts = None
         self._router = None
         self.pdf_processor = PDFProcessor(dpi=config.indexer.image_dpi)
+        self.tabular_processor = TabularProcessor()
 
         # Folder manager can be used without API key for CRUD operations
         # It lazily gets LLM when indexing is needed
@@ -76,6 +80,12 @@ class TreeRAGPipeline:
         if self._indexer is None:
             self._indexer = Indexer(self.config, self.llm)
         return self._indexer
+
+    @property
+    def tabular_indexer(self):
+        if self._tabular_indexer is None:
+            self._tabular_indexer = TabularIndexer(self.config, self.llm)
+        return self._tabular_indexer
 
     @property
     def mcts(self):
@@ -336,6 +346,9 @@ class TreeRAGPipeline:
     # =========================================================================
 
     def index(self, pdf_path, save_path=None):
+        ext = Path(pdf_path).suffix.lower()
+        if ext in SUPPORTED_TABULAR_EXTENSIONS:
+            return self.tabular_indexer.index_document(pdf_path, save_path)
         return self.indexer.index_document(pdf_path, save_path)
 
     def load_index(self, index_path):
@@ -373,20 +386,27 @@ class TreeRAGPipeline:
         results.sort(key=lambda r: r.relevance_score, reverse=True)
         return results
 
+    def _load_file(self, file_path):
+        """Load a file with the appropriate processor based on extension."""
+        ext = Path(file_path).suffix.lower()
+        if ext in SUPPORTED_TABULAR_EXTENSIONS:
+            return self.tabular_processor.load(file_path)
+        return self.pdf_processor.load(file_path)
+
     def _deep_read_node(self, query, result, pdf_path, use_vision):
         """Deep read a single search result node."""
         node = result.node
         try:
-            pdf = self.pdf_processor.load(pdf_path)
+            doc = self._load_file(pdf_path)
         except Exception as e:
-            console.print(f"  [yellow]Cannot open PDF for deep read: {e}[/yellow]")
+            console.print(f"  [yellow]Cannot open file for deep read: {e}[/yellow]")
             return
 
         try:
             if use_vision:
-                images = pdf.get_page_images_batch(node.start_page, node.end_page)
+                images = doc.get_page_images_batch(node.start_page, node.end_page)
                 if not images:
-                    pdf.close()
+                    doc.close()
                     return
                 prompt = f"Query: {query}\nSection: {node.title} (Pages {node.start_page+1}-{node.end_page+1})\nDocument: {result.document_filename}\nExtract ALL relevant information."
                 response = self.llm.complete_with_images(
@@ -394,7 +414,7 @@ class TreeRAGPipeline:
                     system_prompt=SYSTEM_PROMPT_DEEP_READ, json_mode=True, max_tokens=4096,
                 )
             else:
-                text = pdf.get_pages_text_batch(node.start_page, node.end_page)
+                text = doc.get_pages_text_batch(node.start_page, node.end_page)
                 prompt = f"Query: {query}\nSection: {node.title} (Pages {node.start_page+1}-{node.end_page+1})\nDocument: {result.document_filename}\nContent:\n{text}\n\nExtract ALL relevant information."
                 response = self.llm.complete(
                     prompt=prompt, model=self.config.model.answer_model,
@@ -412,7 +432,7 @@ class TreeRAGPipeline:
         except Exception as e:
             console.print(f"  [yellow]Deep read failed for {node.title}: {e}[/yellow]")
         finally:
-            pdf.close()
+            doc.close()
 
     def _find_pdf(self, result, folder_name):
         """Find PDF path for a search result via folder entries."""

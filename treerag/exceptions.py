@@ -31,6 +31,18 @@ class FileTooLargeError(TreeRAGError):
     pass
 
 
+# --- Tabular File Errors ---
+
+class InvalidTabularError(TreeRAGError):
+    """CSV/Excel file cannot be parsed."""
+    pass
+
+
+class EmptyTabularError(TreeRAGError):
+    """CSV/Excel file has no data rows."""
+    pass
+
+
 # --- Folder Errors ---
 
 class FolderNotFoundError(TreeRAGError):

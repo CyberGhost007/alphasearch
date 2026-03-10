@@ -3,11 +3,11 @@ Folder Manager — handles all file operations with comprehensive error handling
 
 Edge cases handled:
 - Corrupt/invalid/empty PDFs → Validated before indexing
-- Non-PDF files → Rejected with clear error
+- Non-PDF/CSV/Excel files → Rejected with clear error
 - File hash caching → Skip re-indexing unchanged files
 - Batch add with partial failures → Report successes AND failures
 - Index files manually deleted → Detected, offers re-index
-- PDF deleted but meta-tree entry remains → Detected on health check
+- PDF/file deleted but meta-tree entry remains → Detected on health check
 - Duplicate filenames from different paths → Warning to user
 - Disk full during write → Atomic writes prevent corrupt state
 - Orphaned index files → Cleanup command
@@ -29,13 +29,18 @@ from .models import (
 )
 from .indexer import Indexer
 from .pdf_processor import PDFProcessor
+from .tabular_processor import TabularProcessor, SUPPORTED_TABULAR_EXTENSIONS
+from .tabular_indexer import TabularIndexer
 from .exceptions import (
     FolderNotFoundError, FolderAlreadyExistsError,
     DocumentNotFoundError, DuplicateFilenameWarning,
     IndexNotFoundError, IndexCorruptError, PDFMissingError,
     IndexingFailedError, BatchIndexingError,
     InvalidFileError, CorruptPDFError, EmptyPDFError, FileTooLargeError,
+    InvalidTabularError, EmptyTabularError,
 )
+
+SUPPORTED_EXTENSIONS = {".pdf"} | SUPPORTED_TABULAR_EXTENSIONS
 
 console = Console()
 
@@ -50,10 +55,12 @@ class FolderManager:
         self.config = config
         self._pipeline = pipeline  # Lazy reference to pipeline for LLM access
         self._indexer = None
+        self._tabular_indexer = None
         self.pdf_processor = PDFProcessor(
             dpi=config.indexer.image_dpi,
             max_pages=config.indexer.max_pages,
         )
+        self.tabular_processor = TabularProcessor()
         self.base_dir = Path(config.folder.base_dir) / "folders"
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._locks: dict[str, threading.Lock] = {}
@@ -61,7 +68,7 @@ class FolderManager:
 
     @property
     def indexer(self):
-        """Lazy-init indexer — only created when actually indexing (needs API key)."""
+        """Lazy-init PDF indexer — only created when actually indexing (needs API key)."""
         if self._indexer is None:
             if self._pipeline:
                 self._indexer = Indexer(self.config, self._pipeline.llm)
@@ -70,6 +77,28 @@ class FolderManager:
                 llm = LLMClient(self.config.model)
                 self._indexer = Indexer(self.config, llm)
         return self._indexer
+
+    @property
+    def tabular_indexer(self):
+        """Lazy-init tabular indexer — only created when indexing CSV/Excel."""
+        if self._tabular_indexer is None:
+            if self._pipeline:
+                self._tabular_indexer = TabularIndexer(self.config, self._pipeline.llm)
+            else:
+                from .llm_client import LLMClient
+                llm = LLMClient(self.config.model)
+                self._tabular_indexer = TabularIndexer(self.config, llm)
+        return self._tabular_indexer
+
+    def _is_tabular(self, file_path: Path) -> bool:
+        """Check if file is a tabular type (CSV/Excel)."""
+        return file_path.suffix.lower() in SUPPORTED_TABULAR_EXTENSIONS
+
+    def _get_indexer(self, file_path: Path):
+        """Return the right indexer for the file type."""
+        if self._is_tabular(file_path):
+            return self.tabular_indexer
+        return self.indexer
 
     def _get_folder_lock(self, folder_name: str) -> threading.Lock:
         with self._locks_lock:
@@ -95,6 +124,7 @@ class FolderManager:
         folder_dir.mkdir(parents=True, exist_ok=True)
         (folder_dir / "indices").mkdir(exist_ok=True)
         (folder_dir / "pdfs").mkdir(exist_ok=True)
+        (folder_dir / "files").mkdir(exist_ok=True)
 
         folder_index = FolderIndex(folder_name=folder_name, folder_path=str(folder_dir))
         folder_index.save(folder_dir / "folder_index.json")
@@ -142,9 +172,9 @@ class FolderManager:
         skip_validation: bool = False,
     ) -> FolderIndex:
         """
-        Add a PDF to a folder with full validation and error handling.
-        
-        Validates: file exists, is PDF, not corrupt, not empty, not too large.
+        Add a document (PDF, CSV, or Excel) to a folder with full validation.
+
+        Validates: file exists, supported type, not corrupt, not empty, not too large.
         Caches: skips indexing if file hash matches.
         Warns: duplicate filenames from different source paths.
         Cleans up: removes partial files on failure.
@@ -160,9 +190,20 @@ class FolderManager:
         # 2. Validate file
         if not pdf_path.exists():
             raise FileNotFoundError(f"File not found: {pdf_path}")
-        
-        # Full PDF validation (type, magic bytes, corrupt, empty, size)
-        file_info = self.pdf_processor.validate(pdf_path)
+
+        ext = pdf_path.suffix.lower()
+        if ext not in SUPPORTED_EXTENSIONS:
+            raise InvalidFileError(
+                f"Unsupported file type: '{pdf_path.name}' (extension: {ext}). "
+                f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+            )
+
+        # Dispatch validation by file type
+        is_tabular = self._is_tabular(pdf_path)
+        if is_tabular:
+            file_info = self.tabular_processor.validate(pdf_path)
+        else:
+            file_info = self.pdf_processor.validate(pdf_path)
 
         # 3. Check cache
         file_hash = compute_file_hash(pdf_path)
@@ -180,10 +221,12 @@ class FolderManager:
                 f"'{existing.source_path}'. Replacing with version from '{pdf_path}'.[/yellow]"
             )
 
-        # 5. Copy PDF to folder (atomic: copy to temp then rename)
+        # 5. Copy file to folder (atomic: copy to temp then rename)
+        # Store in files/ for tabular, pdfs/ for PDFs (backward compat)
         stored_pdf_path = pdf_path
         if copy_pdf:
-            dest = folder_dir / "pdfs" / pdf_path.name
+            storage_subdir = "files" if is_tabular else "pdfs"
+            dest = folder_dir / storage_subdir / pdf_path.name
             if str(pdf_path) != str(dest):
                 try:
                     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -201,22 +244,23 @@ class FolderManager:
                         f"Failed to copy '{pdf_path.name}' to folder: {e}. Check disk space."
                     ) from e
 
-        # 6. Build document tree index
+        # 6. Build document tree index (dispatch by file type)
         index_path = folder_dir / "indices" / f"{pdf_path.stem}_tree.json"
+        indexer = self._get_indexer(pdf_path)
         try:
-            doc_index = self.indexer.index_document(
+            doc_index = indexer.index_document(
                 stored_pdf_path, save_path=index_path,
                 skip_validation=skip_validation,
             )
         except IndexingFailedError:
-            # Cleanup copied PDF if indexing failed
+            # Cleanup copied file if indexing failed
             if copy_pdf and stored_pdf_path != pdf_path and stored_pdf_path.exists():
                 stored_pdf_path.unlink()
             raise
 
         # 7. Generate document-level summary
         console.print("[bold]Generating document summary for meta-tree...[/bold]")
-        summary, keywords = self.indexer.generate_document_summary(stored_pdf_path)
+        summary, keywords = indexer.generate_document_summary(stored_pdf_path)
 
         # 8. Create entry and update folder index (thread-safe)
         entry = FolderDocEntry(
@@ -293,7 +337,11 @@ class FolderManager:
             )
 
         # Delete files (ignore errors — best effort)
-        for path_str in [entry.index_path, str(folder_dir / "pdfs" / filename)]:
+        # Check both pdfs/ and files/ dirs for backward compat
+        paths_to_delete = [entry.index_path]
+        for subdir in ["pdfs", "files"]:
+            paths_to_delete.append(str(folder_dir / subdir / filename))
+        for path_str in paths_to_delete:
             try:
                 p = Path(path_str)
                 if p.exists():

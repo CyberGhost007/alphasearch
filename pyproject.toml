@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 authors = [
     {name = "KnightOwl"},
 ]
-keywords = ["mcts", "document-retrieval", "rag", "pdf", "search", "llm"]
+keywords = ["mcts", "document-retrieval", "rag", "pdf", "csv", "excel", "search", "llm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -35,6 +35,9 @@ dependencies = [
     "fastapi>=0.110.0",
     "uvicorn>=0.29.0",
     "python-multipart>=0.0.9",
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0",
+    "matplotlib>=3.7.0",
 ]
 
 [project.optional-dependencies]
